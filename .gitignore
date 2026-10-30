@@ -1,0 +1,32 @@
+# ---- Build output ----
+/dist/
+/target/
+node_modules/
+
+# ---- Local toolchains (installed into the workspace on this machine) ----
+/.toolchain/
+/.cargo/
+/.npmcache/
+
+# ---- Local scratch / logs ----
+/.tmp/
+*.log
+
+# ---- Local code-signing material (never commit) ----
+/.certs/
+*.pfx
+*.p12
+*.cer
+
+# ---- Local-only Tauri override (signing identity, machine-specific) ----
+/src-tauri/tauri.local.conf.json
+
+# ---- Editor / OS noise ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ---- Test / coverage ----
+/coverage/
