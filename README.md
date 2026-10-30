@@ -13,6 +13,8 @@ MarkThink 是一个基于 Tauri v2 的跨平台 Markdown 阅读器。它用系�
 
 作者：[云间Yuki](https://github.com/inku2333)
 
+欢迎提出各种建议和意见^_^
+
 ---
 
 ## 特性
