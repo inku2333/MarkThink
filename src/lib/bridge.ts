@@ -69,6 +69,8 @@ export interface InterpretRequest {
   history: ChatTurn[];
   maxTokens?: number;
   temperature?: number;
+  /** "default" | "high" | "higher" | "max" — see EFFORT_LEVELS. */
+  reasoningEffort?: string;
 }
 
 export interface DeltaPayload {

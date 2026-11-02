@@ -20,12 +20,15 @@ pub fn take_initial_path(state: tauri::State<'_, InitialPath>) -> Option<String>
 }
 
 fn is_markdown_path(path: &Path) -> bool {
+    // Kept in sync with `isMarkdownFile()` in src/lib/utils.ts: the open dialog
+    // accepts .txt, so the sidebar must list it too.
     matches!(
         path.extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .as_deref(),
         Some("md") | Some("markdown") | Some("mdown") | Some("mkd") | Some("mdx") | Some("mdwn")
+            | Some("txt")
     )
 }
 

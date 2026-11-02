@@ -39,6 +39,102 @@ pub struct InterpretRequest {
     pub history: Vec<ChatTurn>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// `default` | `high` | `higher` | `max` — see [`Effort`].
+    pub reasoning_effort: Option<String>,
+}
+
+/// How much reasoning budget the user asked for.
+///
+/// This is a different knob from `temperature`: temperature controls sampling
+/// randomness, effort controls how much work the model may spend before it
+/// answers. Providers expose it under different names (and some not at all),
+/// which [`native_effort`] and [`effort_prompt`] handle together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Default,
+    High,
+    Higher,
+    Max,
+}
+
+impl Effort {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "high" => Effort::High,
+            "higher" => Effort::Higher,
+            "max" => Effort::Max,
+            _ => Effort::Default,
+        }
+    }
+
+    pub fn is_default(self) -> bool {
+        self == Effort::Default
+    }
+}
+
+/// Depth instruction appended to the system prompt.
+///
+/// Models without a native reasoning budget still need the level to change
+/// something, otherwise the selector would be decorative for them.
+pub fn effort_prompt(effort: Effort, language: &str) -> &'static str {
+    let zh = is_chinese(language);
+    match (effort, zh) {
+        (Effort::Default, _) => "",
+        (Effort::High, true) => "\n\n思考深度：充分。先列出关键前提与假设，再给出结论。",
+        (Effort::Higher, true) => {
+            "\n\n思考深度：极高。先做结构化的逐步推理，逐一检验反例与边界情况，再给出结论。"
+        }
+        (Effort::Max, true) => {
+            "\n\n思考深度：拉满。穷尽可能的解读路径，交叉验证每一个判断，明确标出不确定之处，再给出结论。"
+        }
+        (Effort::High, false) => {
+            "\n\nReasoning depth: thorough. State your premises before concluding."
+        }
+        (Effort::Higher, false) => {
+            "\n\nReasoning depth: very high. Reason step by step, test counter-examples and edge cases before concluding."
+        }
+        (Effort::Max, false) => {
+            "\n\nReasoning depth: maximum. Explore every plausible reading, cross-check each judgement, and flag what stays uncertain before concluding."
+        }
+    }
+}
+
+/// Last path segment of a model id (`openai/o3` → `o3`), lower-cased.
+pub fn model_tail(model: &str) -> String {
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Models that pin `temperature` and reject any other value.
+///
+/// Kept in sync with `temperatureLocked()` in `src/state/ai.ts`.
+pub fn temperature_locked(model: &str) -> bool {
+    let m = model_tail(model);
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("gpt-5")
+        || m.contains("deepseek-reasoner")
+}
+
+/// Whether the provider exposes a native reasoning budget for this model.
+///
+/// Mirrors `reasoningStyle()` in `src/state/ai.ts`.
+pub fn native_effort(protocol: &str, model: &str) -> bool {
+    let m = model_tail(model);
+    match protocol {
+        "openai" => {
+            m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5")
+        }
+        "anthropic" => m.contains("claude"),
+        "gemini" => m.starts_with("gemini-2.5") || m.starts_with("gemini-3"),
+        "ollama" => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +295,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn effort_levels_parse_and_change_the_prompt() {
+        assert_eq!(Effort::parse(None), Effort::Default);
+        assert_eq!(Effort::parse(Some("high")), Effort::High);
+        assert_eq!(Effort::parse(Some("HIGHER")), Effort::Higher);
+        assert_eq!(Effort::parse(Some("max")), Effort::Max);
+        assert_eq!(Effort::parse(Some("nonsense")), Effort::Default);
+
+        // Every non-default level must alter the system prompt: providers
+        // without a native budget rely on exactly this to honour the setting.
+        assert_eq!(effort_prompt(Effort::Default, "简体中文"), "");
+        let high = effort_prompt(Effort::High, "简体中文");
+        let higher = effort_prompt(Effort::Higher, "简体中文");
+        let max = effort_prompt(Effort::Max, "简体中文");
+        assert!(!high.is_empty() && !higher.is_empty() && !max.is_empty());
+        assert_ne!(high, higher);
+        assert_ne!(higher, max);
+        assert_ne!(high, max);
+        // The English prompt must not leak Chinese instructions.
+        assert!(!effort_prompt(Effort::Max, "English").contains('思'));
+    }
+
+    #[test]
+    fn temperature_is_locked_for_reasoning_models() {
+        assert!(temperature_locked("o3-mini"));
+        assert!(temperature_locked("openai/o3"));
+        assert!(temperature_locked("deepseek-reasoner"));
+        assert!(!temperature_locked("gpt-4o"));
+        assert!(!temperature_locked("deepseek-chat"));
+    }
+
+    #[test]
+    fn native_effort_matches_each_protocol() {
+        assert!(native_effort("openai", "o3-mini"));
+        assert!(native_effort("anthropic", "claude-sonnet-4-5"));
+        assert!(native_effort("gemini", "gemini-2.5-flash"));
+        assert!(native_effort("ollama", "qwen3.5:4b"));
+        // Old models have no reasoning budget knob; they get the prompt only.
+        assert!(!native_effort("openai", "gpt-4o"));
+        assert!(!native_effort("gemini", "gemini-2.0-flash"));
+    }
+
+    #[test]
     fn overview_prompt_is_localised() {
         let zh = mode_prompt("overview", "简体中文");
         assert!(zh.contains("简体中文"));
@@ -249,6 +387,7 @@ mod tests {
             history: vec![],
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
         };
         let msg = build_user_message(&req);
         assert!(msg.contains("<document>"));
@@ -273,6 +412,7 @@ mod tests {
             history: vec![],
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
         };
         let msg = build_user_message(&req);
         assert!(msg.contains("content here"));

@@ -60,37 +60,50 @@ fn pick_webview2_data_dir() -> Option<PathBuf> {
 /// Report a startup failure instead of exiting silently.
 ///
 /// A silent exit is the worst failure mode: the user double-clicks the
-/// installed exe and nothing happens, with no clue why. Show a native dialog
-/// naming the concrete cause and the fix.
+/// installed exe and nothing happens, with no clue why. The report is written
+/// to a log file and handed to the system's default text viewer.
+///
+/// No shell is spawned for this on purpose: a Chinese message embedded in a
+/// command line is at the mercy of the process code page, which is exactly how
+/// such messages end up garbled, and a hidden `powershell` child is also a
+/// classic false positive for antivirus heuristics.
 fn report_startup_failure(message: &str) {
+    let detail = startup_guidance(message);
     eprintln!("MarkThink failed to start: {message}");
+    eprintln!("{detail}");
 
-    #[cfg(target_os = "windows")]
-    {
-        let detail = startup_guidance(message);
-        let script = format!(
-            "Add-Type -AssemblyName PresentationFramework; \
-             [System.Windows.MessageBox]::Show('{body}','MarkThink 无法启动', \
-             [System.Windows.MessageBoxButton]::OK, \
-             [System.Windows.MessageBoxImage]::Error) | Out-Null",
-            body = escape_ps(&detail)
-        );
-        let _ = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &script,
-            ])
-            .status();
+    if let Some(path) = write_startup_report(&detail) {
+        let _ = open::that_detached(&path);
+    }
+}
+
+/// Write the failure report to the first writable location and return its path.
+fn write_startup_report(detail: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(base) = dirs::data_local_dir() {
+        candidates.push(base.join("app.markthink.reader").join("startup-error.txt"));
+    }
+    // The temp area is always writable for the signed-in user.
+    candidates.push(std::env::temp_dir().join("markthink-startup-error.txt"));
+    // Last resort: next to the executable, so a portable copy still reports.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("startup-error.txt"));
+        }
     }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        eprintln!("{}", startup_guidance(message));
+    let body = format!("MarkThink 启动失败\n\n{detail}\n");
+    for path in candidates {
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        if std::fs::write(&path, &body).is_ok() {
+            return Some(path);
+        }
     }
+    None
 }
 
 /// Turn a raw startup error into an actionable instruction.
@@ -108,12 +121,6 @@ fn startup_guidance(message: &str) -> String {
     } else {
         format!("MarkThink 启动失败。\n\n技术信息：{message}")
     }
-}
-
-/// Escape single quotes so the message survives being embedded in a
-/// PowerShell single-quoted string.
-fn escape_ps(s: &str) -> String {
-    s.replace('\'', "''")
 }
 
 pub fn run() {

@@ -14,7 +14,7 @@ import {
   Check,
   Brain,
 } from "lucide-react";
-import { useAi, MODES, LANGUAGES, type InterpretMode } from "@/state/ai";
+import { useAi, MODES, LANGUAGES, EFFORT_LEVELS, CONTEXT_MIN, CONTEXT_MAX, temperatureMax, temperatureLocked, reasoningStyle, type InterpretMode, type ReasoningEffort } from "@/state/ai";
 import { useDoc } from "@/state/document";
 import { bridge } from "@/lib/bridge";
 import { renderMarkdown } from "@/lib/markdown";
@@ -27,6 +27,75 @@ interface Props {
 
 /** Modes that take the whole document as context. */
 const DOC_MODES: InterpretMode[] = ["overview", "outline", "critique", "explain"];
+
+/**
+ * Numeric input that keeps a local draft while typing.
+ *
+ * A controlled number input re-renders from the store on every keystroke, so
+ * clamping mid-typing mangles the value the user is entering ("300000" becomes
+ * "2000" after the first digit). The draft is committed on blur/Enter, and the
+ * store clamps the committed value.
+ */
+function NumberField({
+  value,
+  min,
+  max,
+  step,
+  disabled,
+  label,
+  onCommit,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  disabled?: boolean;
+  label: string;
+  onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = (raw: string) => {
+    setDraft(null);
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) onCommit(parsed);
+  };
+  return (
+    <input
+      className="ai-num"
+      type="number"
+      min={min}
+      max={max}
+      step={step}
+      value={draft ?? String(value)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          commit((e.target as HTMLInputElement).value);
+          (e.target as HTMLInputElement).blur();
+        }
+      }}
+      disabled={disabled}
+      aria-label={label}
+    />
+  );
+}
+
+/** Wire name of the reasoning knob, shown so the user can see what we send. */
+function nativeParamName(protocol: string): string {
+  switch (protocol) {
+    case "openai":
+      return "reasoning_effort";
+    case "anthropic":
+      return "thinking.budget_tokens";
+    case "gemini":
+      return "thinkingBudget";
+    case "ollama":
+      return "think";
+    default:
+      return "推理参数";
+  }
+}
 
 export default function AiPanel({ onClose, push }: Props) {
   const ai = useAi();
@@ -47,6 +116,16 @@ export default function AiPanel({ onClose, push }: Props) {
 
   const provider = ai.providers.find((p) => p.id === ai.provider);
   const activeRun = ai.runs.find((r) => r.id === ai.activeRunId) ?? ai.runs[0] ?? null;
+
+  // Effective model + the two capability decisions the panel must explain:
+  // whether the effort level reaches the API natively, and whether the model
+  // accepts a custom temperature at all.
+  const effectiveModel = ai.model || provider?.defaultModel || "";
+  const effort: ReasoningEffort = ai.reasoningEffort ?? "default";
+  const effortLevel = EFFORT_LEVELS.find((l) => l.id === effort) ?? EFFORT_LEVELS[0];
+  const effortStyle = reasoningStyle(provider?.protocol ?? "", effectiveModel);
+  const tempLocked = temperatureLocked(provider?.protocol ?? "", effectiveModel, effort);
+  const tempMax = temperatureMax(provider?.protocol ?? "");
 
   // Load the provider catalogue on first mount.
   useEffect(() => {
@@ -169,6 +248,7 @@ export default function AiPanel({ onClose, push }: Props) {
           history,
           maxTokens: ai.maxTokens,
           temperature: ai.temperature,
+          reasoningEffort: effort,
         });
       } catch (err) {
         useAi.getState().failRun(requestId, String(err));
@@ -176,7 +256,7 @@ export default function AiPanel({ onClose, push }: Props) {
         activeRunRef.current = null;
       }
     },
-    [doc, provider, ai, documentText, push],
+    [doc, provider, ai, documentText, push, effort],
   );
 
   const cancel = useCallback(async () => {
@@ -370,37 +450,87 @@ export default function AiPanel({ onClose, push }: Props) {
 
             <div className="ai-field">
               <label className="ai-label">
-                上下文上限 <span className="ai-value">{(ai.contextChars / 1000).toFixed(0)}k 字</span>
+                上下文上限（字符）
+                <NumberField
+                  value={ai.contextChars}
+                  min={CONTEXT_MIN}
+                  max={CONTEXT_MAX}
+                  step={1000}
+                  disabled={ai.running}
+                  label="上下文上限（字符）"
+                  onCommit={(v) => ai.update("contextChars", v)}
+                />
               </label>
               <input
                 type="range"
-                min={8000}
-                max={200000}
-                step={2000}
+                min={CONTEXT_MIN}
+                max={CONTEXT_MAX}
+                step={1000}
                 value={ai.contextChars}
                 onChange={(e) => ai.update("contextChars", Number(e.target.value))}
                 disabled={ai.running}
               />
-              {truncated && (
-                <span className="ai-hint" style={{ color: "var(--accent-text)" }}>
-                  文档较长，超出部分不会发送给模型
-                </span>
-              )}
+              <span className="ai-hint">
+                最多发送 {ai.contextChars.toLocaleString()} 字符
+                {doc ? `，当前文档 ${doc.content.length.toLocaleString()} 字符` : ""}
+                {truncated ? "，超出部分不会发送" : ""}
+              </span>
             </div>
 
             <div className="ai-field">
               <label className="ai-label">
-                发散度 <span className="ai-value">{ai.temperature.toFixed(2)}</span>
+                发散度（temperature）
+                <NumberField
+                  value={ai.temperature}
+                  min={0}
+                  max={tempMax}
+                  step={0.05}
+                  disabled={ai.running}
+                  label="发散度"
+                  onCommit={(v) => ai.update("temperature", v)}
+                />
               </label>
               <input
                 type="range"
                 min={0}
-                max={1.2}
+                max={tempMax}
                 step={0.05}
                 value={ai.temperature}
                 onChange={(e) => ai.update("temperature", Number(e.target.value))}
                 disabled={ai.running}
               />
+              <span className="ai-hint">
+                {tempLocked
+                  ? "当前模型不接受自定义 temperature（推理型模型固定采样），发送时自动省略"
+                  : `越低越收敛、越高越发散，本次发送 temperature = ${ai.temperature.toFixed(2)}`}
+              </span>
+            </div>
+
+            <div className="ai-field">
+              <label className="ai-label">
+                思考强度
+                <span className="ai-value">{effortLevel.level}</span>
+              </label>
+              <div className="ai-segment">
+                {EFFORT_LEVELS.map((l) => (
+                  <button
+                    key={l.id}
+                    className={cn("ai-mode", effort === l.id && "active")}
+                    onClick={() => ai.update("reasoningEffort", l.id)}
+                    disabled={ai.running}
+                    title={l.hint}
+                  >
+                    {l.label}
+                  </button>
+                ))}
+              </div>
+              <span className="ai-hint">
+                {effort === "default"
+                  ? "默认档不附加任何推理参数，模型按自身默认深度作答"
+                  : effortStyle === "native"
+                    ? `${effortLevel.level}档通过原生参数 ${nativeParamName(provider?.protocol ?? "")} 下发`
+                    : `${effortLevel.level}档：当前模型没有原生推理参数，改用系统提示词加大推理深度`}
+              </span>
             </div>
 
             <div className="ai-field">
@@ -442,7 +572,7 @@ export default function AiPanel({ onClose, push }: Props) {
             {doc && (
               <span style={{ fontSize: 11.5, color: "var(--text-tertiary)" }}>
                 当前文档 {docWords.toLocaleString()} 字
-                {truncated ? `（发送前 ${(ai.contextChars / 1000).toFixed(0)}k 字）` : ""}
+                {truncated ? `（发送前 ${ai.contextChars.toLocaleString()} 字符）` : ""}
               </span>
             )}
           </div>

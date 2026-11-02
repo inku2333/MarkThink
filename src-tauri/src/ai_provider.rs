@@ -1,5 +1,6 @@
 use crate::ai::{
-    build_user_message, mode_prompt, AiProvider, DeltaPayload, InterpretRequest, StatusPayload,
+    build_user_message, effort_prompt, mode_prompt, native_effort, temperature_locked, AiProvider,
+    DeltaPayload, Effort, InterpretRequest, StatusPayload,
 };
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -356,6 +357,143 @@ fn effective_model(req: &InterpretRequest, provider: &AiProvider) -> String {
         .unwrap_or_else(|| "default".into())
 }
 
+/// System prompt with the depth instruction for the selected effort level.
+fn system_prompt(req: &InterpretRequest) -> String {
+    let effort = Effort::parse(req.reasoning_effort.as_deref());
+    format!(
+        "{}{}",
+        mode_prompt(&req.mode, &req.language),
+        effort_prompt(effort, &req.language)
+    )
+}
+
+/// Clamp the requested temperature to what the protocol accepts.
+///
+/// Anthropic rejects anything above 1, the others accept up to 2. Clamping here
+/// keeps a value that was valid for another provider from turning into a 400.
+fn temperature_for(req: &InterpretRequest, max: f32) -> f32 {
+    req.temperature.unwrap_or(0.4).clamp(0.0, max)
+}
+
+/// OpenAI-compatible request body.
+///
+/// `temperature` is dropped for models that pin it (o-series, gpt-5,
+/// deepseek-reasoner) — sending it there is a guaranteed HTTP 400.
+fn openai_body(
+    req: &InterpretRequest,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let effort = Effort::parse(req.reasoning_effort.as_deref());
+    let mut body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "max_tokens": req.max_tokens.unwrap_or(4096),
+        "messages": messages,
+    });
+
+    if !temperature_locked(model) {
+        body["temperature"] = serde_json::json!(temperature_for(req, 2.0));
+    }
+
+    if !effort.is_default() && native_effort("openai", model) {
+        // OpenAI exposes three levels; `max` differs from `higher` by the
+        // deeper instruction carried in the system prompt.
+        body["reasoning_effort"] =
+            serde_json::json!(if effort == Effort::High { "medium" } else { "high" });
+    }
+    body
+}
+
+/// Anthropic request body with extended thinking.
+///
+/// `budget_tokens` must stay below `max_tokens`, and the API requires
+/// `temperature = 1` while thinking is on — so a custom temperature is only
+/// sent when thinking is off.
+fn anthropic_body(
+    req: &InterpretRequest,
+    model: &str,
+    system: &str,
+    messages: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let effort = Effort::parse(req.reasoning_effort.as_deref());
+    let mut max_tokens = req.max_tokens.unwrap_or(4096);
+    let mut body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "system": system,
+        "messages": messages,
+    });
+
+    if !effort.is_default() && native_effort("anthropic", model) {
+        let budget = match effort {
+            Effort::Higher => 8192,
+            Effort::Max => 24576,
+            _ => 2048,
+        };
+        max_tokens = max_tokens.max(budget + 1024);
+        body["thinking"] = serde_json::json!({ "type": "enabled", "budget_tokens": budget });
+    } else {
+        body["temperature"] = serde_json::json!(temperature_for(req, 1.0));
+    }
+
+    body["max_tokens"] = serde_json::json!(max_tokens);
+    body
+}
+
+/// Gemini request body with `thinkingConfig` for 2.5+ models.
+fn gemini_body(
+    req: &InterpretRequest,
+    model: &str,
+    system: &str,
+    contents: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let effort = Effort::parse(req.reasoning_effort.as_deref());
+    let mut generation = serde_json::json!({
+        "temperature": temperature_for(req, 2.0),
+        "maxOutputTokens": req.max_tokens.unwrap_or(4096),
+    });
+
+    if !effort.is_default() && native_effort("gemini", model) {
+        let budget = match effort {
+            Effort::Higher => 12288,
+            Effort::Max => 24576,
+            _ => 4096,
+        };
+        generation["thinkingConfig"] = serde_json::json!({ "thinkingBudget": budget });
+    }
+
+    serde_json::json!({
+        "systemInstruction": { "parts": [{ "text": system }] },
+        "contents": contents,
+        "generationConfig": generation,
+    })
+}
+
+/// Ollama request body. `think` is a boolean there, so the finer levels ride
+/// along in the system prompt.
+fn ollama_body(
+    req: &InterpretRequest,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let effort = Effort::parse(req.reasoning_effort.as_deref());
+    let mut body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "messages": messages,
+        "options": {
+            "temperature": temperature_for(req, 2.0),
+            "num_predict": req.max_tokens.unwrap_or(4096),
+        },
+    });
+
+    if !effort.is_default() {
+        body["think"] = serde_json::json!(true);
+    }
+    body
+}
+
 /// Consume an SSE/NDJSON response, emitting deltas as they arrive.
 ///
 /// Reasoning text is held back while the answer streams in. Some thinking
@@ -434,7 +572,7 @@ async fn run_openai_like(
 
     let mut messages = vec![serde_json::json!({
         "role": "system",
-        "content": mode_prompt(&req.mode, &req.language)
+        "content": system_prompt(&req)
     })];
     for turn in &req.history {
         messages.push(serde_json::json!({ "role": turn.role, "content": turn.content }));
@@ -444,13 +582,7 @@ async fn run_openai_like(
         "content": build_user_message(&req)
     }));
 
-    let body = serde_json::json!({
-        "model": model,
-        "stream": true,
-        "temperature": req.temperature.unwrap_or(0.4),
-        "max_tokens": req.max_tokens.unwrap_or(4096),
-        "messages": messages,
-    });
+    let body = openai_body(&req, &model, messages);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -493,14 +625,7 @@ async fn run_anthropic(
         "content": build_user_message(&req)
     }));
 
-    let body = serde_json::json!({
-        "model": model,
-        "max_tokens": req.max_tokens.unwrap_or(4096),
-        "temperature": req.temperature.unwrap_or(0.4),
-        "system": mode_prompt(&req.mode, &req.language),
-        "messages": messages,
-        "stream": true,
-    });
+    let body = anthropic_body(&req, &model, &system_prompt(&req), messages);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -549,14 +674,7 @@ async fn run_gemini(
         "parts": [{ "text": build_user_message(&req) }]
     }));
 
-    let body = serde_json::json!({
-        "systemInstruction": { "parts": [{ "text": mode_prompt(&req.mode, &req.language) }] },
-        "contents": contents,
-        "generationConfig": {
-            "temperature": req.temperature.unwrap_or(0.4),
-            "maxOutputTokens": req.max_tokens.unwrap_or(4096),
-        },
-    });
+    let body = gemini_body(&req, &model, &system_prompt(&req), contents);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -593,7 +711,7 @@ async fn run_ollama(
 
     let mut messages = vec![serde_json::json!({
         "role": "system",
-        "content": mode_prompt(&req.mode, &req.language)
+        "content": system_prompt(&req)
     })];
     for turn in &req.history {
         messages.push(serde_json::json!({ "role": turn.role, "content": turn.content }));
@@ -603,15 +721,7 @@ async fn run_ollama(
         "content": build_user_message(&req)
     }));
 
-    let body = serde_json::json!({
-        "model": model,
-        "stream": true,
-        "messages": messages,
-        "options": {
-            "temperature": req.temperature.unwrap_or(0.4),
-            "num_predict": req.max_tokens.unwrap_or(4096),
-        },
-    });
+    let body = ollama_body(&req, &model, messages);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -911,6 +1021,151 @@ mod tests {
         // A chunk with neither field is not an event.
         let empty = r#"{"message":{"content":"","thinking":""},"done":false}"#;
         assert_eq!(parse_ollama_line(empty), None);
+    }
+
+    /// Minimal request fixture for the body builders.
+    fn sample_req(model: &str, effort: &str) -> InterpretRequest {
+        InterpretRequest {
+            request_id: "test".into(),
+            provider: "openai".into(),
+            endpoint: None,
+            model: Some(model.into()),
+            api_key: None,
+            mode: "overview".into(),
+            language: "简体中文".into(),
+            instruction: None,
+            document_title: Some("测试".into()),
+            content: "正文".into(),
+            history: vec![],
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            reasoning_effort: Some(effort.into()),
+        }
+    }
+
+    /// `temperature` is an f32, so compare numerically instead of by JSON value.
+    fn temperature_of(body: &serde_json::Value) -> Option<f64> {
+        body.get("temperature").and_then(|v| v.as_f64())
+    }
+
+    #[test]
+    fn openai_body_keeps_temperature_only_where_it_is_accepted() {
+        let plain = openai_body(&sample_req("gpt-4o", "default"), "gpt-4o", vec![]);
+        let t = temperature_of(&plain).expect("plain models keep the temperature");
+        assert!((t - 0.7).abs() < 1e-6, "got {t}");
+
+        let reasoning = openai_body(&sample_req("o3-mini", "default"), "o3-mini", vec![]);
+        assert!(
+            reasoning.get("temperature").is_none(),
+            "o-series rejects any temperature other than 1"
+        );
+        assert!(
+            reasoning.get("reasoning_effort").is_none(),
+            "the default level must not send a budget"
+        );
+    }
+
+    #[test]
+    fn openai_body_maps_effort_to_reasoning_effort() {
+        let high = openai_body(&sample_req("o3-mini", "high"), "o3-mini", vec![]);
+        assert_eq!(high["reasoning_effort"], serde_json::json!("medium"));
+
+        let higher = openai_body(&sample_req("o3-mini", "higher"), "o3-mini", vec![]);
+        assert_eq!(higher["reasoning_effort"], serde_json::json!("high"));
+
+        let max = openai_body(&sample_req("o3-mini", "max"), "o3-mini", vec![]);
+        assert_eq!(max["reasoning_effort"], serde_json::json!("high"));
+
+        // A model without the parameter must not receive an unknown field.
+        let unsupported = openai_body(&sample_req("gpt-4o", "max"), "gpt-4o", vec![]);
+        assert!(unsupported.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn anthropic_body_raises_max_tokens_above_the_thinking_budget() {
+        let body = anthropic_body(
+            &sample_req("claude-sonnet-4-5", "higher"),
+            "claude-sonnet-4-5",
+            "sys",
+            vec![],
+        );
+        assert_eq!(body["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(8192));
+        assert!(
+            body["max_tokens"].as_u64().unwrap_or(0) > 8192,
+            "budget_tokens must stay below max_tokens"
+        );
+        assert!(
+            body.get("temperature").is_none(),
+            "extended thinking requires temperature = 1"
+        );
+    }
+
+    #[test]
+    fn anthropic_body_keeps_temperature_when_thinking_is_off() {
+        let body = anthropic_body(
+            &sample_req("claude-sonnet-4-5", "default"),
+            "claude-sonnet-4-5",
+            "sys",
+            vec![],
+        );
+        let t = temperature_of(&body).expect("temperature must survive without thinking");
+        assert!((t - 0.7).abs() < 1e-6, "got {t}");
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], serde_json::json!(4096));
+    }
+
+    #[test]
+    fn gemini_body_sets_a_thinking_budget() {
+        let body = gemini_body(
+            &sample_req("gemini-2.5-flash", "high"),
+            "gemini-2.5-flash",
+            "sys",
+            vec![],
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            serde_json::json!(4096)
+        );
+
+        let off = gemini_body(
+            &sample_req("gemini-2.5-flash", "default"),
+            "gemini-2.5-flash",
+            "sys",
+            vec![],
+        );
+        assert!(off["generationConfig"].get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn ollama_body_enables_think_only_above_default() {
+        let on = ollama_body(&sample_req("qwen3.5:4b", "high"), "qwen3.5:4b", vec![]);
+        assert_eq!(on["think"], serde_json::json!(true));
+
+        let off = ollama_body(&sample_req("qwen3.5:4b", "default"), "qwen3.5:4b", vec![]);
+        assert!(off.get("think").is_none());
+    }
+
+    #[test]
+    fn anthropic_temperature_is_clamped_to_its_range() {
+        let mut req = sample_req("claude-sonnet-4-5", "default");
+        req.temperature = Some(1.5);
+        let body = anthropic_body(&req, "claude-sonnet-4-5", "sys", vec![]);
+        assert_eq!(temperature_of(&body), Some(1.0));
+
+        // The same value is legal for the other protocols.
+        let openai = openai_body(&req, "gpt-4o", vec![]);
+        assert_eq!(temperature_of(&openai), Some(1.5));
+    }
+
+    #[test]
+    fn system_prompt_carries_the_effort_instruction() {
+        let high = system_prompt(&sample_req("gpt-4o", "high"));
+        assert!(high.contains("思考深度"), "effort must reach prompt-only models");
+
+        let default = system_prompt(&sample_req("gpt-4o", "default"));
+        assert!(!default.contains("思考深度"));
+        assert!(default.contains("核心论点"), "the mode prompt must survive");
     }
 
     #[test]

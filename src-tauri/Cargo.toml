@@ -1,6 +1,6 @@
 [package]
 name = "markthink"
-version = "1.0.0"
+version = "1.0.1"
 description = "MarkThink — a modern Markdown reader with AI interpretation"
 authors = ["云间Yuki"]
 edition = "2021"
