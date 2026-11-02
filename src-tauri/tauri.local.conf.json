@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "windows": {
+      "certificateThumbprint": "863DC8E2E88BDCED7422A50D1756A24F3BEF9CA4"
+    }
+  }
+}
