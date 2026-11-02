@@ -11,7 +11,12 @@ interface DocState {
   outline: { id: string; text: string; level: number }[];
   activeHeading: string | null;
 
-  open: (path: string) => Promise<void>;
+  /**
+   * Load a document. Resolves to `null` on success, or a human-readable error
+   * message on failure — callers surface it as a toast, so a dropped file that
+   * cannot be read never fails silently.
+   */
+  open: (path: string) => Promise<string | null>;
   openContent: (content: string, name: string) => void;
   close: () => void;
   setOutline: (outline: DocState["outline"]) => void;
@@ -55,13 +60,16 @@ export const useDoc = create<DocState>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const doc = await bridge.readDocument(path);
-      set({ doc, loading: false, outline: [] });
+      set({ doc, loading: false, outline: [], activeHeading: null });
       get().pushRecent(path);
       if (bridge.available) {
         void bridge.watchFile(path).catch(() => {});
       }
+      return null;
     } catch (err) {
-      set({ loading: false, error: String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      set({ loading: false, error: message });
+      return message;
     }
   },
 

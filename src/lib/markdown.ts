@@ -257,7 +257,9 @@ export async function enhanceDom(
   const tasks: Promise<void>[] = [];
 
   if (opts.codeHighlight) {
-    const blocks = root.querySelectorAll<HTMLElement>(".md-code[data-code]");
+    // Already-upgraded blocks are skipped: re-highlighting replaces their
+    // innerHTML on every pass, which throws away the search marks inside code.
+    const blocks = root.querySelectorAll<HTMLElement>('.md-code[data-code]:not([data-enhanced="1"])');
     tasks.push(
       (async () => {
         await initHighlighter();

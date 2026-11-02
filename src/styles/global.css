@@ -266,6 +266,10 @@ a {
   overflow-x: hidden;
   scroll-behavior: smooth;
   overscroll-behavior: contain;
+  /* Windowed rendering keeps the viewport anchored itself (chunk heights are
+     measured after mount); the browser's own anchoring would apply a second,
+     competing correction. */
+  overflow-anchor: none;
 }
 
 .reader-content {

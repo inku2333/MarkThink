@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Search, ChevronUp, ChevronDown, X, FileText, FolderOpen } from "lucide-react";
 import { useDoc } from "@/state/document";
 import { useSettings } from "@/state/settings";
 import { bridge } from "@/lib/bridge";
-import { renderMarkdown, enhanceDom, type RenderOptions } from "@/lib/markdown";
+import { renderMarkdown, type RenderOptions } from "@/lib/markdown";
 import { splitBlocks, type Block } from "@/lib/blocks";
+import { planChunks } from "@/lib/chunks";
+import { buildChunkTexts, findMatches } from "@/lib/search";
 import { countWords, readingTime, cn, formatBytes } from "@/lib/utils";
 import VirtualDocument from "./VirtualDocument";
 
@@ -13,15 +15,15 @@ interface Props {
 }
 
 export default function Reader({ onOpenFile }: Props) {
-  const { doc, setOutline, setActiveHeading, activeHeading, outline } = useDoc();
+  const { doc, setOutline, setActiveHeading, outline } = useDoc();
   const settings = useSettings();
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
   const [showTop, setShowTop] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<{ index: number; count: number }>({ index: 0, count: 0 });
   const [scrollPct, setScrollPct] = useState(0);
 
   const renderOpts: RenderOptions = useMemo(
@@ -49,13 +51,10 @@ export default function Reader({ onOpenFile }: Props) {
     return splitBlocks(doc.content);
   }, [doc?.content]);
 
-  // Large documents are rendered windowed; small ones render in a single pass.
-  const windowed = blocks.length > 60;
-
-  const single = useMemo(() => {
-    if (!doc || windowed) return null;
-    return renderMarkdown(doc.content, renderOpts);
-  }, [doc?.content, renderOpts, windowed]);
+  // Chunk layout shared with the renderer. Computing it once here (instead of
+  // independently in both places) is what keeps a match's chunk number pointing
+  // at the DOM node that actually contains it.
+  const chunks = useMemo(() => planChunks(blocks), [blocks]);
 
   // Publish the outline.
   //
@@ -74,21 +73,15 @@ export default function Reader({ onOpenFile }: Props) {
     setOutline(headings);
   }, [doc?.content, renderOpts, setOutline]);
 
-  // Post-render enhancement: syntax highlighting, math, diagrams.
-  useEffect(() => {
-    if (!contentRef.current || !single) return;
-    let cancelled = false;
-    const root = contentRef.current;
-    // Defer so the first paint is instant.
-    const id = requestAnimationFrame(() => {
-      if (cancelled) return;
-      void enhanceDom(root, renderOpts);
-    });
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(id);
-    };
-  }, [single?.html, renderOpts]);
+  // Stable identity: VirtualDocument re-runs this effect whenever the callback
+  // changes, and a fresh arrow per render would null the ref in between.
+  const handleRootReady = useCallback((root: HTMLDivElement | null) => {
+    contentRef.current = root;
+  }, []);
+
+  // Post-render enhancement (syntax highlighting, math, diagrams) lives in
+  // VirtualDocument: it owns the mounted subtree, and it re-applies search
+  // marks after a code block has been re-rendered.
 
   // Resolve relative image paths through the backend when a document is on disk.
   useEffect(() => {
@@ -112,12 +105,12 @@ export default function Reader({ onOpenFile }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [doc?.meta.path, single?.html]);
+  }, [doc?.meta.path, blocks]);
 
   // Reset scroll when a different document is opened.
   useEffect(() => {
     if (!doc?.meta.path && !doc?.meta.name) return;
-    scrollRef.current?.scrollTo({ top: 0 });
+    scrollRef.current?.scrollTo({ top: 0, behavior: "instant" });
     setScrollPct(0);
     setShowTop(false);
   }, [doc?.meta.path, doc?.meta.name]);
@@ -161,7 +154,7 @@ export default function Reader({ onOpenFile }: Props) {
       el.removeEventListener("scroll", onScroll);
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [single?.html, setActiveHeading, windowed, blocks.length]);
+  }, [blocks, setActiveHeading]);
 
   // Jump to a heading. In windowed mode the target may be unmounted, so fall
   // back to scrolling the container by a fraction of the document height.
@@ -182,82 +175,72 @@ export default function Reader({ onOpenFile }: Props) {
     },
     [outline],
   );
-  // Search: highlight matches inside the rendered content.
-  const runSearch = useCallback(
-    (q: string) => {
-      const root = contentRef.current;
-      if (!root) return;
-      // Clear previous highlights first.
-      root.querySelectorAll("mark.search-hit").forEach((m) => {
-        const parent = m.parentNode;
-        if (!parent) return;
-        parent.replaceChild(document.createTextNode(m.textContent ?? ""), m);
-        parent.normalize();
-      });
-      if (!q.trim()) {
-        setHits({ index: 0, count: 0 });
-        return;
-      }
-      const needle = q.toLowerCase();
-      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-        acceptNode(node) {
-          const parent = node.parentElement;
-          if (!parent) return NodeFilter.FILTER_REJECT;
-          if (parent.closest("mark.search-hit, script, style")) return NodeFilter.FILTER_REJECT;
-          return (node.nodeValue ?? "").toLowerCase().includes(needle)
-            ? NodeFilter.FILTER_ACCEPT
-            : NodeFilter.FILTER_REJECT;
-        },
-      });
-      const nodes: Text[] = [];
-      while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+  // Search index, built from the document rather than the mounted DOM.
+  //
+  // Indexing the document makes the match list complete and stable; the old
+  // implementation walked `contentRef`, which under windowed rendering only
+  // holds the chunks near the viewport, and "next/prev" broke whenever chunks
+  // mounted or unmounted while scrolling.
+  //
+  // The plain text of every chunk is rendered once per document (opening the
+  // search bar is what triggers it) and then reused, so typing only scans text.
+  // Rebuilding it per keystroke re-rendered the whole document on every
+  // character, which made large files feel like search was stalling.
+  const deferredQuery = useDeferredValue(query);
 
-      let total = 0;
-      for (const node of nodes) {
-        const raw = node.nodeValue ?? "";
-        const lower = raw.toLowerCase();
-        const frag = document.createDocumentFragment();
-        let last = 0;
-        let idx = lower.indexOf(needle);
-        while (idx !== -1) {
-          if (idx > last) frag.appendChild(document.createTextNode(raw.slice(last, idx)));
-          const mark = document.createElement("mark");
-          mark.className = "search-hit";
-          mark.textContent = raw.slice(idx, idx + q.length);
-          frag.appendChild(mark);
-          total++;
-          last = idx + q.length;
-          idx = lower.indexOf(needle, last);
-        }
-        if (last < raw.length) frag.appendChild(document.createTextNode(raw.slice(last)));
-        node.replaceWith(frag);
-      }
-      setHits({ index: total > 0 ? 1 : 0, count: total });
-      if (total > 0) jumpToHit(0);
-    },
-    [],
+  const chunkTexts = useMemo(() => {
+    if (!doc || !searchOpen) return [] as string[];
+    return buildChunkTexts(blocks, chunks, renderOpts);
+  }, [doc?.content, blocks, chunks, renderOpts, searchOpen]);
+
+  const matches = useMemo(
+    () => findMatches(chunkTexts, deferredQuery),
+    [chunkTexts, deferredQuery],
   );
 
-  const jumpToHit = useCallback((index: number) => {
-    const root = contentRef.current;
-    if (!root) return;
-    const marks = Array.from(root.querySelectorAll<HTMLElement>("mark.search-hit"));
-    if (marks.length === 0) return;
-    const clamped = ((index % marks.length) + marks.length) % marks.length;
-    marks.forEach((m, i) => m.classList.toggle("current", i === clamped));
-    marks[clamped].scrollIntoView({ behavior: "smooth", block: "center" });
-    setHits({ index: clamped + 1, count: marks.length });
-  }, []);
+  const [hitIndex, setHitIndex] = useState(0);
+  // Bumped whenever the active hit must be scrolled into view. VirtualDocument
+  // resolves it against real layout, including chunks that are not mounted.
+  const [revealToken, setRevealToken] = useState(0);
 
+  const hit = matches.length > 0 ? Math.min(hitIndex, matches.length - 1) : -1;
+  const activeMatch = hit >= 0 ? matches[hit] : null;
+
+  // A new query (or reopening the bar) starts from the first hit.
   useEffect(() => {
+    setHitIndex(0);
     if (!searchOpen) return;
-    const t = setTimeout(() => runSearch(query), 180);
-    return () => clearTimeout(t);
-  }, [query, searchOpen, runSearch]);
+    setRevealToken((t) => t + 1);
+  }, [deferredQuery, searchOpen]);
+
+  // Move by `delta` hits, wrapping around. A functional update keeps rapid
+  // Enter presses (and the arrow buttons) from reading a stale index.
+  const stepHit = useCallback(
+    (delta: number) => {
+      if (matches.length === 0) return;
+      setHitIndex((prev) => {
+        const current = Math.min(prev, matches.length - 1);
+        return ((current + delta) % matches.length + matches.length) % matches.length;
+      });
+      setRevealToken((t) => t + 1);
+    },
+    [matches.length],
+  );
+
+  // Open the bar, or bring it back into focus when it is already open — that is
+  // what Ctrl+F does in every other reader, and it avoids the "Ctrl+F did
+  // nothing" feeling after the bar lost focus.
+  const focusSearch = useCallback(() => {
+    setSearchOpen(true);
+    requestAnimationFrame(() => {
+      searchRef.current?.focus();
+      searchRef.current?.select();
+    });
+  }, []);
 
   // Window-level commands from the title bar.
   useEffect(() => {
-    const onToggleSearch = () => setSearchOpen((v) => !v);
+    const onToggleSearch = () => focusSearch();
     const onEscape = () => setSearchOpen(false);
     const onExport = () => void exportHtml();
     const onCopyMd = () => void copyToClipboard(doc?.content ?? "");
@@ -280,7 +263,7 @@ export default function Reader({ onOpenFile }: Props) {
       window.removeEventListener("markthink://print", onPrint);
       window.removeEventListener("markthink://jump-heading", onJump);
     };
-  }, [doc?.content, jumpToHeading]);
+  }, [doc?.content, jumpToHeading, focusSearch]);
 
   const exportHtml = async () => {
     if (!doc || !bridge.available) return;
@@ -306,7 +289,6 @@ export default function Reader({ onOpenFile }: Props) {
   };
 
   // Keyboard: Ctrl+F focus, Enter/Shift+Enter to step through hits.
-  const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (searchOpen) {
       searchRef.current?.focus();
@@ -317,7 +299,7 @@ export default function Reader({ onOpenFile }: Props) {
   const onSearchKey = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      jumpToHit(hits.index - 1 + (e.shiftKey ? -1 : 1));
+      stepHit(e.shiftKey ? -1 : 1);
     } else if (e.key === "Escape") {
       setSearchOpen(false);
     }
@@ -348,15 +330,19 @@ export default function Reader({ onOpenFile }: Props) {
             onKeyDown={onSearchKey}
           />
           <span className="search-count">
-            {hits.count > 0 ? `${hits.index} / ${hits.count}` : query ? "无结果" : ""}
+            {matches.length > 0
+              ? `${hit + 1} / ${matches.length}`
+              : deferredQuery.trim()
+                ? "无结果"
+                : ""}
           </span>
-          <button className="btn-icon" onClick={() => jumpToHit(hits.index - 2)} title="上一个 (Shift+Enter)">
+          <button className="btn-icon" onClick={() => stepHit(-1)} title="上一个 (Shift+Enter)">
             <ChevronUp size={16} />
           </button>
-          <button className="btn-icon" onClick={() => jumpToHit(hits.index)} title="下一个 (Enter)">
+          <button className="btn-icon" onClick={() => stepHit(1)} title="下一个 (Enter)">
             <ChevronDown size={16} />
           </button>
-          <button className="btn-icon" onClick={() => { setSearchOpen(false); setQuery(""); runSearch(""); }} title="关闭 (Esc)">
+          <button className="btn-icon" onClick={() => { setSearchOpen(false); setQuery(""); }} title="关闭 (Esc)">
             <X size={16} />
           </button>
         </div>
@@ -370,9 +356,15 @@ export default function Reader({ onOpenFile }: Props) {
         <div className="reader-content" key={doc.meta.path || doc.meta.name}>
           <VirtualDocument
             blocks={blocks}
+            chunks={chunks}
             renderOpts={renderOpts}
+            theme={settings.theme}
             scrollRef={scrollRef}
-            onRootReady={(root) => { contentRef.current = root; }}
+            searchQuery={searchOpen ? deferredQuery : ""}
+            activeChunk={activeMatch?.chunkIndex ?? -1}
+            activeOrdinalInChunk={activeMatch?.ordinalInChunk ?? -1}
+            revealToken={revealToken}
+            onRootReady={handleRootReady}
             onLinkClick={(href, e) => {
               if (/^(https?:|mailto:)/i.test(href)) {
                 e.preventDefault();

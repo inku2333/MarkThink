@@ -9,7 +9,7 @@ import AiPanel from "@/components/AiPanel";
 import AboutDialog from "@/components/AboutDialog";
 import SettingsDialog from "@/components/SettingsDialog";
 import Toast, { useToasts } from "@/components/Toast";
-import { isMarkdownFile } from "@/lib/utils";
+import { isMarkdownFile, basename } from "@/lib/utils";
 
 export default function App() {
   const { doc, open, close } = useDoc();
@@ -20,27 +20,72 @@ export default function App() {
   const { toasts, push } = useToasts();
 
   // Drag-and-drop a file anywhere on the window.
+  //
+  // With `dragDropEnabled: true` in tauri.conf.json, Tauri takes over drag-and-drop
+  // at the native level: the webview never receives HTML5 `drop` events, so
+  // `e.dataTransfer.files` is always empty. The native event carries real file
+  // paths instead, which is what the reader needs. The DOM listeners below stay
+  // for the browser preview, where no native event exists.
+  //
+  // Failures are surfaced as a toast: `open()` reports why a file could not be
+  // read (deleted, permission, a directory, …), and swallowing that message is
+  // indistinguishable from "dragging does nothing".
   useEffect(() => {
-    const onDragOver = (e: DragEvent) => {
-      e.preventDefault();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
-    };
-    const onDrop = async (e: DragEvent) => {
-      e.preventDefault();
-      const file = e.dataTransfer?.files?.[0];
-      if (!file) return;
-      const path = (file as File & { path?: string }).path;
-      if (path && isMarkdownFile(path)) {
-        await open(path);
-      } else {
-        push(`不支持的文件类型: ${file.name}`, "error");
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    const openDropped = async (paths: string[]) => {
+      if (paths.length === 0) return;
+      const target = paths.find(isMarkdownFile);
+      if (!target) {
+        push(`不支持的文件类型: ${basename(paths[0])}`, "error");
+        return;
       }
+      const error = await open(target);
+      if (error) push(`打开失败: ${error}`, "error");
     };
-    window.addEventListener("dragover", onDragOver);
-    window.addEventListener("drop", onDrop);
+
+    if (!bridge.available) {
+      const onDragOver = (e: DragEvent) => {
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      };
+      const onDrop = (e: DragEvent) => {
+        e.preventDefault();
+        if ((e.dataTransfer?.files?.length ?? 0) > 0) {
+          push("拖拽打开需要桌面版，请在应用内使用", "error");
+        }
+      };
+      window.addEventListener("dragover", onDragOver);
+      window.addEventListener("drop", onDrop);
+      return () => {
+        window.removeEventListener("dragover", onDragOver);
+        window.removeEventListener("drop", onDrop);
+      };
+    }
+
+    void (async () => {
+      try {
+        const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+        const fn = await getCurrentWebview().onDragDropEvent((event) => {
+          if (event.payload.type !== "drop") return;
+          void openDropped(event.payload.paths ?? []);
+        });
+        if (disposed) fn();
+        else unlisten = fn;
+      } catch (err) {
+        // Still register the DOM path so the window is not left with no drop
+        // handling at all; the native event is simply missing.
+        console.warn("native drag-drop unavailable:", err);
+        const onDragOver = (e: DragEvent) => e.preventDefault();
+        window.addEventListener("dragover", onDragOver);
+        unlisten = () => window.removeEventListener("dragover", onDragOver);
+      }
+    })();
+
     return () => {
-      window.removeEventListener("dragover", onDragOver);
-      window.removeEventListener("drop", onDrop);
+      disposed = true;
+      unlisten?.();
     };
   }, [open, push]);
 
@@ -50,11 +95,17 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     void (async () => {
       const initial = await bridge.takeInitialPath();
-      if (initial) await open(initial);
-      unlisten = await bridge.onOpenPath((path) => void open(path));
+      if (initial) {
+        const error = await open(initial);
+        if (error) push(`打开失败: ${error}`, "error");
+      }
+      unlisten = await bridge.onOpenPath(async (path) => {
+        const error = await open(path);
+        if (error) push(`打开失败: ${error}`, "error");
+      });
     })();
     return () => unlisten?.();
-  }, [open]);
+  }, [open, push]);
 
   // Watch for external modifications when auto-reload is on.
   useEffect(() => {
@@ -64,8 +115,9 @@ export default function App() {
       .onFileChanged(async (p) => {
         if (p.path !== doc.meta.path) return;
         if (p.kind === "modify" || p.kind === "create") {
-          await open(p.path);
-          push("文档已在外部更新");
+          const error = await open(p.path);
+          if (error) push(`重新加载失败: ${error}`, "error");
+          else push("文档已在外部更新");
         }
       })
       .then((fn) => {
@@ -90,7 +142,10 @@ export default function App() {
       directory: false,
       filters: [{ name: "Markdown", extensions: ["md", "markdown", "mdown", "mkd", "mdx", "txt"] }],
     });
-    if (typeof selected === "string") await open(selected);
+    if (typeof selected === "string") {
+      const error = await open(selected);
+      if (error) push(`打开失败: ${error}`, "error");
+    }
   }, [open, push]);
 
   const openFolder = useCallback(async () => {

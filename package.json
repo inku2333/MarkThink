@@ -1,16 +1,17 @@
 {
   "name": "markthink",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
     "preview": "vite preview",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri": "node scripts/toolchain.mjs tauri",
+    "tauri:dev": "node scripts/toolchain.mjs tauri dev",
+    "tauri:build": "node scripts/toolchain.mjs tauri build",
+    "rust:test": "node scripts/toolchain.mjs cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.0",
