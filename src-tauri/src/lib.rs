@@ -1,5 +1,6 @@
 mod ai;
 mod ai_provider;
+mod close;
 mod commands;
 mod document;
 mod watcher;
@@ -144,6 +145,7 @@ pub fn run() {
 
     let result = builder
         .manage(watcher::WatcherState::default())
+        .manage(close::CloseState::default())
         .manage(ai_provider::CancelState::default())
         .manage(commands::InitialPath::default())
         .invoke_handler(tauri::generate_handler![
@@ -151,10 +153,18 @@ pub fn run() {
             commands::list_workspace,
             commands::read_binary,
             commands::export_html,
+            commands::save_document,
+            commands::ai_output_dir,
+            commands::save_ai_markdown,
             commands::resolve_path,
             commands::app_info,
             commands::open_external,
             commands::take_initial_path,
+            close::set_unsaved,
+
+            close::close_pending,
+            close::cancel_close,
+            close::confirm_close,
             watcher::watch_file,
             watcher::unwatch_file,
             ai_provider::list_providers,
@@ -167,6 +177,39 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
+
+                // Handle the window close button entirely in Rust.
+                //
+                // The previous implementation intercepted `close-requested` in
+                // the webview and let the Tauri JS API destroy the window. That
+                // path is fragile: `onCloseRequested` calls `destroy()` on the
+                // JS side, which needs `core:window:allow-destroy`, and when the
+                // call fails the window simply never closes — the reported
+                // "clicking X does nothing, kill it from Task Manager" bug.
+                //
+                // Doing it here removes the dependency on a web permission and
+                // on the webview being awake: the window asks a shared flag
+                // whether anything is unsaved. If it is, the close is cancelled
+                // and the frontend is told to show its dialog; the frontend then
+                // calls `confirm_close` (or `force_close`) to finish.
+                let handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        let dirty = close::dirty(&handle);
+                        let pending = close::is_pending(&handle);
+                        if pending {
+                            // The dialog is already up; a second click means
+                            // "yes, really" and closes.
+                            return;
+                        }
+                        if dirty {
+                            api.prevent_close();
+                            close::mark_close_pending(&handle);
+                            use tauri::Emitter;
+                            let _ = handle.emit("markthink://close-requested", ());
+                        }
+                    }
+                });
             }
 
             // Open a document passed on the command line (file association).

@@ -193,6 +193,216 @@ pub async fn export_html(payload: ExportPayload) -> Result<String, String> {
     Ok(p.to_string_lossy().into_owned())
 }
 
+/// What the frontend learns after a successful write.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedDocument {
+    pub path: String,
+    pub name: String,
+    pub dir: String,
+    pub size: u64,
+    pub modified_ms: Option<u64>,
+    pub encoding: String,
+}
+
+/// Pick the encoding marker to write back with.
+///
+/// `read_document` reports "UTF-8 (BOM)" when the file started with one. That
+/// information has to survive an edit round-trip: rewriting a BOM'd file as
+/// plain UTF-8 silently changes its bytes, and some Windows toolchains treat
+/// the two differently.
+fn bom_for(encoding: &str) -> Option<&'static [u8]> {
+    let normalized = encoding.to_ascii_lowercase();
+    if normalized.contains("bom") {
+        Some(&[0xEF, 0xBB, 0xBF])
+    } else {
+        None
+    }
+}
+
+/// Overwrite a Markdown file with edited content.
+///
+/// The write is atomic: the new bytes go to a sibling temporary file which is
+/// then renamed over the original. A half-written document (crash, full disk,
+/// a killed process) would otherwise destroy the only copy of the user's file,
+/// and this is the one command in the app that mutates user data.
+#[tauri::command]
+pub async fn save_document(
+    path: String,
+    content: String,
+    encoding: Option<String>,
+) -> Result<SavedDocument, String> {
+    let target = PathBuf::from(&path);
+    if target.is_dir() {
+        return Err("这是一个目录，无法保存".into());
+    }
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+
+    let mut bytes: Vec<u8> = Vec::with_capacity(content.len() + 3);
+    if let Some(bom) = bom_for(encoding.as_deref().unwrap_or("utf-8")) {
+        bytes.extend_from_slice(bom);
+    }
+    bytes.extend_from_slice(content.as_bytes());
+
+    let file_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document.md");
+    let temp = dir.join(format!(".{file_name}.markthink-save"));
+    fs::write(&temp, &bytes).map_err(|e| format!("写入失败: {e}"))?;
+    if let Err(err) = fs::rename(&temp, &target) {
+        // Renaming over an existing file can fail on Windows when the target
+        // is locked (an editor, a sync client). Fall back to writing in place
+        // rather than leaving the temporary file behind.
+        let _ = fs::remove_file(&temp);
+        fs::write(&target, &bytes).map_err(|e| format!("保存失败: {e} ({err})"))?;
+    }
+
+    let meta = fs::metadata(&target).map_err(|e| format!("无法读取文件信息: {e}"))?;
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    let info = meta_for(&target, meta.len(), encoding.unwrap_or_else(|| "UTF-8".into()), content.lines().count());
+    Ok(SavedDocument {
+        path: info.path,
+        name: info.name,
+        dir: info.dir,
+        size: info.size,
+        modified_ms,
+        encoding: info.encoding,
+    })
+}
+
+/// The folder AI output is written to when the user has not chosen one.
+///
+/// "Next to the executable" is deliberate: the artefacts are something the user
+/// paid for (a model call) and must be easy to find, back up and keep. On a
+/// normal install that is `%LOCALAPPDATA%\...\MarkThink\` next to
+/// `markthink.exe`; in dev it sits beside `target/debug/markthink.exe`.
+fn default_ai_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("MarkThink-AI")
+}
+
+/// Where AI output goes, creating the folder if needed.
+#[tauri::command]
+pub fn ai_output_dir(custom: Option<String>) -> Result<String, String> {
+    let raw = custom
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_ai_dir);
+    fs::create_dir_all(&raw)
+        .map_err(|e| format!("无法创建 AI 目录 {}: {e}", raw.display()))?;
+    Ok(raw.to_string_lossy().into_owned())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSaveResult {
+    pub path: String,
+    pub dir: String,
+    pub name: String,
+    pub created: bool,
+}
+
+/// Write one AI result to its own Markdown file and return the path.
+///
+/// `stem` is the base file name (already sanitised by the caller). When the
+/// file exists the content is compared first: an identical result reuses the
+/// existing file so repeated saves do not litter the folder, while a changed
+/// result gets a numeric suffix instead of overwriting yesterday's answer —
+/// the whole point is that the output is not lost.
+#[tauri::command]
+pub fn save_ai_markdown(
+    dir: Option<String>,
+    stem: String,
+    content: String,
+) -> Result<AiSaveResult, String> {
+    let target_dir = ai_output_dir(dir.clone())?;
+    let dir_path = PathBuf::from(&target_dir);
+
+    let safe_stem = sanitize_file_stem(&stem);
+    if safe_stem.is_empty() {
+        return Err("文件名为空".into());
+    }
+
+    let mut candidate = dir_path.join(format!("{safe_stem}.md"));
+    let mut suffix = 2;
+    let mut created = true;
+
+    loop {
+        match fs::read_to_string(&candidate) {
+            Ok(existing) => {
+                if existing == content {
+                    // Same content: reuse it instead of creating a duplicate.
+                    created = false;
+                    break;
+                }
+                // Different content: pick the next free numbered name.
+                candidate = dir_path.join(format!("{safe_stem} ({suffix}).md"));
+                suffix += 1;
+                if suffix > 999 {
+                    return Err("同名文件过多，请清理 AI 目录后重试".into());
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let temp = dir_path.join(format!(
+        ".{}.markthink-save",
+        candidate.file_name().and_then(|n| n.to_str()).unwrap_or("ai")
+    ));
+    fs::write(&temp, content.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
+    if let Err(err) = fs::rename(&temp, &candidate) {
+        let _ = fs::remove_file(&temp);
+        fs::write(&candidate, content.as_bytes()).map_err(|e| format!("保存失败: {e} ({err})"))?;
+    }
+
+    Ok(AiSaveResult {
+        path: candidate.to_string_lossy().into_owned(),
+        dir: target_dir,
+        name: candidate
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("AI.md")
+            .to_string(),
+        created,
+    })
+}
+
+/// Replace characters Windows forbids in a file name, and trim trailing dots
+/// and spaces (also forbidden). Keeps CJK untouched.
+fn sanitize_file_stem(stem: &str) -> String {
+    let cleaned: String = stem
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    cleaned
+        .trim()
+        .trim_end_matches(['.', ' '])
+        .chars()
+        .take(120)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Resolve a possibly-relative link target against the document directory.
 #[tauri::command]
 pub fn resolve_path(base: String, target: String) -> String {
