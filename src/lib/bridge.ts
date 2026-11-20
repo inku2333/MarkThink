@@ -36,6 +36,23 @@ export interface AppInfo {
   homeDir: string | null;
 }
 
+export interface SavedDocument {
+  path: string;
+  name: string;
+  dir: string;
+  size: number;
+  modifiedMs: number | null;
+  encoding: string;
+}
+
+export interface AiSaveResult {
+  path: string;
+  dir: string;
+  name: string;
+  /** False when an identical file already existed and was reused. */
+  created: boolean;
+}
+
 export interface AiProvider {
   id: string;
   name: string;
@@ -112,6 +129,47 @@ export const bridge = {
     return invoke<string>("export_html", { payload: { path, html } });
   },
 
+  async saveDocument(path: string, content: string, encoding?: string): Promise<SavedDocument> {
+    return invoke<SavedDocument>("save_document", { path, content, encoding });
+  },
+
+  /** Resolve (and create) the folder AI output is written to. */
+  async aiOutputDir(custom?: string): Promise<string> {
+    return invoke<string>("ai_output_dir", { custom: custom || null });
+  },
+
+  async saveAiMarkdown(
+    dir: string | undefined,
+    stem: string,
+    content: string,
+  ): Promise<AiSaveResult> {
+    return invoke<AiSaveResult>("save_ai_markdown", { dir: dir || null, stem, content });
+  },
+
+  /**
+   * Tell the native close guard whether anything has unsaved edits.
+   *
+   * The window's ✕ is handled in Rust, which cannot see the document store.
+   */
+  async setUnsaved(dirty: boolean): Promise<void> {
+    return invoke("set_unsaved", { dirty });
+  },
+
+  /** Close the window for real; call only after the user approved. */
+  async confirmClose(): Promise<void> {
+    return invoke("confirm_close");
+  },
+
+  /** The user chose to stay open. */
+  async cancelClose(): Promise<void> {
+    return invoke("cancel_close");
+  },
+
+  /** Is a native close request waiting for an answer? */
+  async closePending(): Promise<boolean> {
+    return invoke<boolean>("close_pending");
+  },
+
   async resolvePath(base: string, target: string): Promise<string> {
     return invoke<string>("resolve_path", { base, target });
   },
@@ -175,5 +233,10 @@ export const bridge = {
 
   async onOpenPath(cb: (path: string) => void): Promise<UnlistenFn> {
     return listen<{ path: string }>("markthink://open-path", (e) => cb(e.payload.path));
+  },
+
+  /** Emitted by the Rust close handler when the window needs confirmation. */
+  async onCloseRequested(cb: () => void): Promise<UnlistenFn> {
+    return listen("markthink://close-requested", () => cb());
   },
 };

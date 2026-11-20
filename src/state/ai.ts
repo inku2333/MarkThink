@@ -43,6 +43,8 @@ export interface InterpretRun {
   createdAt: number;
   /** Question that produced this run, for `qa` mode. */
   question?: string;
+  /** Absolute path of the archived Markdown, once it has been written. */
+  savedPath?: string;
 }
 
 /** How hard the model should think before answering. */
@@ -164,6 +166,8 @@ interface AiStore extends AiSettings {
   failRun: (runId: string, message: string) => void;
   cancelRun: (runId: string) => void;
   setActive: (runId: string | null) => void;
+  /** Record where the run's Markdown landed, so the UI can open it again. */
+  setRunFile: (runId: string, path: string) => void;
   removeRun: (runId: string) => void;
   clearRuns: () => void;
   pushHistory: (turn: ChatTurn) => void;
@@ -263,6 +267,11 @@ export const useAi = create<AiStore>()(
         })),
 
       setActive: (runId) => set({ activeRunId: runId }),
+
+      setRunFile: (runId, path) =>
+        set((s) => ({
+          runs: s.runs.map((r) => (r.id === runId ? { ...r, savedPath: path } : r)),
+        })),
 
       removeRun: (runId) =>
         set((s) => ({

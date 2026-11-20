@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { X, RotateCcw } from "lucide-react";
 import { useSettings, ACCENTS, DEFAULT_SETTINGS, type ThemeMode } from "@/state/settings";
+import { bridge } from "@/lib/bridge";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -12,6 +13,31 @@ type Tab = "appearance" | "reading" | "markdown";
 export default function SettingsDialog({ onClose }: Props) {
   const s = useSettings();
   const [tab, setTab] = useState<Tab>("appearance");
+  /** Resolved location of the AI folder, shown so the user knows where files go. */
+  const [aiDir, setAiDir] = useState<string>("");
+
+  useEffect(() => {
+    if (!bridge.available) return;
+    let cancelled = false;
+    void bridge
+      .aiOutputDir(s.aiSaveDir || undefined)
+      .then((dir) => {
+        if (!cancelled) setAiDir(dir);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [s.aiSaveDir]);
+
+  const pickAiDir = async () => {
+    if (!bridge.available) return;
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const dir = await open({ multiple: false, directory: true });
+    if (typeof dir === "string") s.update("aiSaveDir", dir);
+  };
+
+  const aiDirLabel = aiDir || "程序同级的 MarkThink-AI 文件夹";
 
   return (
     <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -197,6 +223,43 @@ export default function SettingsDialog({ onClose }: Props) {
 
           {tab === "markdown" && (
             <>
+              <div className="settings-group">
+                <div className="settings-group-title">AI 结果保存</div>
+
+                <div className="settings-row">
+                  <div className="settings-row-label">
+                    <div className="settings-row-title">保存位置</div>
+                    <div className="settings-row-desc">{aiDirLabel}</div>
+                  </div>
+                  <button className="btn btn-outline" onClick={() => void pickAiDir()}>
+                    选择…
+                  </button>
+                </div>
+
+                <div className="settings-row">
+                  <div className="settings-row-label">
+                    <div className="settings-row-title">完成后自动打开</div>
+                    <div className="settings-row-desc">每次解读完成，结果直接在标签中打开</div>
+                  </div>
+                  <div
+                    className={cn("switch", s.openSavedArtifacts && "on")}
+                    onClick={() => s.update("openSavedArtifacts", !s.openSavedArtifacts)}
+                  />
+                </div>
+
+                <div className="settings-row">
+                  <div className="settings-row-label">
+                    <div className="settings-row-title">恢复默认位置</div>
+                    <div className="settings-row-desc">
+                      当前：{s.aiSaveDir || "程序同级的 MarkThink-AI 文件夹"}
+                    </div>
+                  </div>
+                  <button className="btn btn-ghost" onClick={() => s.update("aiSaveDir", "")}>
+                    使用默认
+                  </button>
+                </div>
+              </div>
+
               <div className="settings-group">
                 <div className="settings-group-title">渲染能力</div>
 

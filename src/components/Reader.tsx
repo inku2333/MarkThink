@@ -9,13 +9,16 @@ import { planChunks } from "@/lib/chunks";
 import { buildChunkTexts, findMatches } from "@/lib/search";
 import { countWords, readingTime, cn, formatBytes } from "@/lib/utils";
 import VirtualDocument from "./VirtualDocument";
+import VisualEditor from "./VisualEditor";
+import SourceEditor from "./SourceEditor";
 
 interface Props {
   onOpenFile: () => void;
+  push: (message: string, kind?: "info" | "error") => void;
 }
 
-export default function Reader({ onOpenFile }: Props) {
-  const { doc, setOutline, setActiveHeading, outline } = useDoc();
+export default function Reader({ onOpenFile, push }: Props) {
+  const { doc, setOutline, setActiveHeading, outline, tabs, activeId, setDraft, setScroll } = useDoc();
   const settings = useSettings();
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -25,6 +28,10 @@ export default function Reader({ onOpenFile }: Props) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [scrollPct, setScrollPct] = useState(0);
+
+  const tab = tabs.find((t) => t.id === activeId) ?? null;
+  const viewMode = tab?.viewMode ?? "read";
+  const editing = viewMode !== "read";
 
   const renderOpts: RenderOptions = useMemo(
     () => ({
@@ -107,15 +114,75 @@ export default function Reader({ onOpenFile }: Props) {
     };
   }, [doc?.meta.path, blocks]);
 
-  // Reset scroll when a different document is opened.
+  // Restore the reading position for the active tab.
+  //
+  // This must re-run when the *view* comes back to 阅读, not just when the tab
+  // changes: switching to 编辑 unmounts `.reader-scroll`, and the freshly
+  // mounted one starts at scrollTop 0. Keying the restore on `doc.id` alone
+  // meant "restored already" stayed true across the switch, so coming back
+  // always landed on page one.
+  const restoredFor = useRef<string | null>(null);
   useEffect(() => {
-    if (!doc?.meta.path && !doc?.meta.name) return;
-    scrollRef.current?.scrollTo({ top: 0, behavior: "instant" });
-    setScrollPct(0);
-    setShowTop(false);
-  }, [doc?.meta.path, doc?.meta.name]);
+    if (editing) return;
+    const id = doc?.id ?? null;
+    if (!id) {
+      restoredFor.current = null;
+      return;
+    }
+    const el = scrollRef.current;
+    if (!el) return;
+    const key = `${id}:${viewMode}`;
+    if (restoredFor.current === key && el.scrollTop > 0) return;
+    restoredFor.current = key;
+
+    // Prefer the pixel offset — it is exact for a plain tab switch. Coming back
+    // from an editor the pixels mean something else (the editor had its own
+    // scroll height), so fall back to the 0–1 fraction the editors report.
+    const max = () => el.scrollHeight - el.clientHeight;
+    const ratio = tab?.scrollRatio ?? 0;
+    const targetFor = () => {
+      const maxPx = max();
+      if (tab && tab.scrollTop > 0 && tab.scrollTop <= maxPx) return tab.scrollTop;
+      return Math.round(maxPx * ratio);
+    };
+
+    // The windowed renderer re-measures chunks after mount and corrects the
+    // offset itself, so a single assignment can be undone. Re-apply on the next
+    // frame and once more after that measure pass has settled.
+    const apply = () => {
+      const target = targetFor();
+      if (Math.abs(el.scrollTop - target) > 2) el.scrollTo({ top: target, behavior: "instant" });
+    };
+    el.scrollTo({ top: targetFor(), behavior: "instant" });
+    const frame = requestAnimationFrame(apply);
+    const settle = window.setTimeout(apply, 80);
+    const start = targetFor();
+    setScrollPct(max() > 0 ? start / max() : 0);
+    setShowTop(start > 600);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.clearTimeout(settle);
+    };
+  }, [doc?.id, editing, viewMode, tab?.scrollTop, tab?.scrollRatio]);
+
+  // Switching away from 阅读 remembers the position even if no scroll event
+  // fired (for example right after restoring it).
+  useEffect(() => {
+    if (!editing) return;
+    const el = scrollRef.current;
+    const id = activeIdRef.current;
+    if (!el || !id) return;
+    const max = el.scrollHeight - el.clientHeight;
+    setScroll(id, el.scrollTop, max > 0 ? el.scrollTop / max : 0);
+  }, [editing, setScroll]);
 
   // Scroll position tracking: progress bar + active heading + back-to-top.
+  //
+  // The position is also written back to the tab (throttled by equality, so an
+  // idle tab never re-renders) — that is how switching tabs restores the
+  // reader's place.
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -128,7 +195,7 @@ export default function Reader({ onOpenFile }: Props) {
         const pct = max > 0 ? el.scrollTop / max : 0;
         setScrollPct(pct);
         setShowTop(el.scrollTop > 600);
-
+        if (activeIdRef.current) setScroll(activeIdRef.current, el.scrollTop, pct);
         if (!contentRef.current) return;
         const containerTop = el.getBoundingClientRect().top;
         const headings = contentRef.current.querySelectorAll<HTMLElement>(
@@ -154,7 +221,7 @@ export default function Reader({ onOpenFile }: Props) {
       el.removeEventListener("scroll", onScroll);
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [blocks, setActiveHeading]);
+  }, [blocks, setActiveHeading, setScroll]);
 
   // Jump to a heading. In windowed mode the target may be unmounted, so fall
   // back to scrolling the container by a fraction of the document height.
@@ -316,6 +383,109 @@ export default function Reader({ onOpenFile }: Props) {
   const wordCount = countWords(doc.content);
   const minutes = readingTime(doc.content);
 
+  // Editing modes take over the whole pane: the editor owns scrolling and
+  // layout, so the reader's virtualisation, search bar and status bar would
+  // all be describing the wrong surface.
+  if (editing) {
+    const resolveImage =
+      doc.meta.path && bridge.available
+        ? async (raw: string) => {
+            try {
+              const resolved = await bridge.resolvePath(doc.meta.path, raw);
+              return await bridge.readBinary(resolved);
+            } catch {
+              return null;
+            }
+          }
+        : undefined;
+
+    const pickImage = async (): Promise<string | null> => {
+      if (!bridge.available) {
+        push("插入图片仅在桌面版可用", "error");
+        return null;
+      }
+      const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"] }],
+      });
+      if (typeof selected !== "string") return null;
+      // A relative path keeps the document portable; fall back to the absolute
+      // path when the image lives outside the document's folder.
+      const dir = doc.meta.dir;
+      const normalized = selected.replace(/\\/g, "/");
+      const base = dir.replace(/\\/g, "/");
+      if (base && normalized.startsWith(`${base}/`)) return normalized.slice(base.length + 1);
+      return normalized;
+    };
+
+    // Both editors restore the tab's 0–1 reading position on mount and report
+    // theirs back, so 阅读 → 编辑 → 阅读 lands where the user was instead of
+    // jumping to page one.
+    const restoreRatio = tab?.scrollRatio ?? 0;
+    const reportRatio = (ratio: number) => {
+      // `scrollTop` is meaningless while an editor owns the pane (the reader's
+      // scroller is unmounted), so only the ratio is carried across views.
+      setScroll(doc.id, tab?.scrollTop ?? 0, ratio);
+    };
+
+    /**
+     * Insert a block the rich-text schema cannot represent.
+     *
+     * Math and diagrams are read-only islands, so the editor cannot create one
+     * from its own commands — the block has to be appended to the Markdown and
+     * then remounted. Doing it by editing the draft keeps the source of truth
+     * in one place: the next `markdownToEditorContent` turns the new fence into
+     * an island on its own.
+     */
+    const insertBlock = (kind: "math" | "mermaid" | "toc" | "pagebreak") => {
+      const templates: Record<string, string> = {
+        math: "$$\nE = mc^2\n$$",
+        mermaid: "```mermaid\ngraph TD\n  A --> B\n```",
+        toc: "",
+        pagebreak: "---",
+      };
+      const block = templates[kind];
+      if (!block) return;
+      const current = useDoc.getState().drafts[doc.id] ?? doc.content;
+      const next = `${current.replace(/\s+$/, "")}\n\n${block}\n`;
+      setDraft(doc.id, next);
+      // The editor is keyed by document id, so remount it to pick up the new
+      // block as a proper island instead of leaving raw text behind.
+      useDoc.getState().setViewMode(doc.id, "visual");
+      push(kind === "math" ? "已插入公式，可在下方编辑源码" : "已插入区块");
+    };
+
+    return (
+      <main className="reader-pane" style={{ position: "relative" }}>
+        {viewMode === "visual" ? (
+          <VisualEditor
+            key={`visual-${doc.id}`}
+            docKey={`visual-${doc.id}`}
+            markdown={doc.content}
+            renderOpts={renderOpts}
+            onChange={(md) => setDraft(doc.id, md)}
+            resolveImage={resolveImage}
+            onRequestImage={pickImage}
+            onInsert={insertBlock}
+            initialScrollRatio={restoreRatio}
+            onScrollRatio={reportRatio}
+          />
+        ) : (
+          <SourceEditor
+            key={`source-${doc.id}`}
+            docKey={`source-${doc.id}`}
+            markdown={doc.content}
+            onChange={(md) => setDraft(doc.id, md)}
+            initialScrollRatio={restoreRatio}
+            onScrollRatio={reportRatio}
+          />
+        )}
+      </main>
+    );
+  }
+
   return (
     <main className="reader-pane" style={{ position: "relative" }}>
       {searchOpen && (
@@ -353,7 +523,7 @@ export default function Reader({ onOpenFile }: Props) {
       </div>
 
       <div className="reader-scroll" ref={scrollRef}>
-        <div className="reader-content" key={doc.meta.path || doc.meta.name}>
+        <div className="reader-content" key={doc.id}>
           <VirtualDocument
             blocks={blocks}
             chunks={chunks}
@@ -392,6 +562,7 @@ export default function Reader({ onOpenFile }: Props) {
         <span className="statusbar-item">{wordCount.toLocaleString()} 字</span>
         <span className="statusbar-item">约 {minutes} 分钟</span>
         <span className="statusbar-spacer" />
+        {doc.dirty && <span className="statusbar-item statusbar-dirty">未保存</span>}
         <span className="statusbar-item">{doc.meta.encoding}</span>
         <span className="statusbar-item">{Math.round(scrollPct * 100)}%</span>
       </footer>

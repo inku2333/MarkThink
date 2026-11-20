@@ -13,11 +13,23 @@ import {
   Copy,
   Check,
   Brain,
+  FileText,
+  FolderOpen,
 } from "lucide-react";
 import { useAi, MODES, LANGUAGES, EFFORT_LEVELS, CONTEXT_MIN, CONTEXT_MAX, temperatureMax, temperatureLocked, reasoningStyle, type InterpretMode, type ReasoningEffort } from "@/state/ai";
 import { useDoc } from "@/state/document";
 import { bridge } from "@/lib/bridge";
 import { renderMarkdown } from "@/lib/markdown";
+import { useSettings, DEFAULT_SETTINGS } from "@/state/settings";
+import { ResizeHandle } from "./ResizeHandle";
+import {
+  runFileStem,
+  runToMarkdown,
+  chatFileStem,
+  chatToMarkdown,
+  type RunContext,
+  type ChatTurnRecord,
+} from "@/lib/ai-artifact";
 import { cn, countWords } from "@/lib/utils";
 
 interface Props {
@@ -100,6 +112,7 @@ function nativeParamName(protocol: string): string {
 export default function AiPanel({ onClose, push }: Props) {
   const ai = useAi();
   const { doc } = useDoc();
+  const { aiPanelWidth, update, aiSaveDir, openSavedArtifacts } = useSettings();
 
   const [mode, setMode] = useState<InterpretMode>("overview");
   const [question, setQuestion] = useState("");
@@ -148,7 +161,19 @@ export default function AiPanel({ onClose, push }: Props) {
           setThinking(false);
           useAi.getState().appendDelta(p.requestId, p.delta);
         }
-        if (p.done) useAi.getState().finishRun(p.requestId);
+        if (p.done) {
+          useAi.getState().finishRun(p.requestId);
+          // Archive the answer as soon as it is complete. The output cost
+          // money, so it is written to disk without asking — a prompt here
+          // would mean losing paid results to a stray Escape.
+          const finished = useAi.getState().runs.find((r) => r.id === p.requestId);
+          if (finished?.mode === "qa" && finished.output.trim()) {
+            // Multi-turn sessions feed back into the next request, so the
+            // assistant turn has to be in the history as well.
+            useAi.getState().pushHistory({ role: "assistant", content: finished.output });
+          }
+          void archiveRun(p.requestId);
+        }
       });
       const unStatus = await bridge.onAiStatus((p) => {
         if (p.requestId !== activeRunRef.current) return;
@@ -266,8 +291,109 @@ export default function AiPanel({ onClose, push }: Props) {
     useAi.getState().cancelRun(id);
   }, []);
 
+  const runContext = useMemo<RunContext>(
+    () => ({
+      documentTitle: doc?.meta.name || "文档",
+      documentPath: doc?.meta.path || undefined,
+      sourceName: doc?.meta.name,
+    }),
+    [doc?.meta.name, doc?.meta.path],
+  );
+
+  /**
+   * Write a finished answer to the AI folder and open it in a tab.
+   *
+   * Auto-opening is what makes the saved artefact discoverable: the user sees
+   * the result as a normal document, with the reader's typography, and the tab
+   * strip is where they expect to find things again.
+   */
+  const archiveRun = useCallback(
+    async (requestId: string) => {
+      if (!bridge.available) return;
+      const state = useAi.getState();
+      const finished = state.runs.find((r) => r.id === requestId);
+      if (!finished || finished.status !== "done" || !finished.output.trim()) return;
+
+      try {
+        const dir = await bridge.aiOutputDir(aiSaveDir || undefined);
+        const saved = await bridge.saveAiMarkdown(
+          aiSaveDir || undefined,
+          runFileStem(finished, runContext),
+          runToMarkdown(finished, runContext),
+        );
+        state.setRunFile(requestId, saved.path);
+        if (saved.created) {
+          push(`已保存到 ${dir}\\${saved.name}`);
+        }
+        if (openSavedArtifacts) {
+          const error = await useDoc.getState().open(saved.path);
+          if (error) push(`打开 AI 结果失败: ${error}`, "error");
+        }
+      } catch (err) {
+        push(`保存 AI 结果失败: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
+    },
+    [aiSaveDir, openSavedArtifacts, runContext, push],
+  );
+
+  /** Reveal the AI output folder in Explorer. */
+  const openAiFolder = async () => {
+    if (!bridge.available) {
+      push("打开文件夹仅在桌面版可用", "error");
+      return;
+    }
+    try {
+      const dir = await bridge.aiOutputDir(aiSaveDir || undefined);
+      await bridge.openExternal(dir);
+    } catch (err) {
+      push(`打开文件夹失败: ${err instanceof Error ? err.message : String(err)}`, "error");
+    }
+  };
+
+  /**
+   * Save the whole Q&A session as one transcript.
+   *
+   * A follow-up question only makes sense next to what came before it, so the
+   * conversation is archived as a single file rather than as a pile of
+   * individual answers.
+   */
+  const saveConversation = async () => {
+    if (!bridge.available) {
+      push("保存会话仅在桌面版可用", "error");
+      return;
+    }
+    const turns: ChatTurnRecord[] = [];
+    for (const run of [...ai.runs].filter((r) => r.mode === "qa").sort((a, b) => a.createdAt - b.createdAt)) {
+      const question = run.question?.trim();
+      if (!question) continue;
+      turns.push({
+        question,
+        answer: run.output,
+        createdAt: run.createdAt,
+        provider: run.provider,
+        model: run.model,
+        language: run.language,
+      });
+    }
+    if (turns.length === 0) {
+      push("还没有可以保存的对话", "info");
+      return;
+    }
+    try {
+      const saved = await bridge.saveAiMarkdown(
+        aiSaveDir || undefined,
+        chatFileStem(turns, runContext),
+        chatToMarkdown(turns, runContext),
+      );
+      push(saved.created ? `会话已保存：${saved.name}` : `会话已存在：${saved.name}`);
+      const error = await useDoc.getState().open(saved.path);
+      if (error) push(`打开会话失败: ${error}`, "error");
+    } catch (err) {
+      push(`保存会话失败: ${err instanceof Error ? err.message : String(err)}`, "error");
+    }
+  };
+
   const test = async () => {
-    setTesting(true);
     try {
       const msg = await bridge.testProvider(
         ai.provider,
@@ -300,10 +426,30 @@ export default function AiPanel({ onClose, push }: Props) {
   );
 
   return (
-    <aside className="ai-panel">
+    <>
+      <ResizeHandle
+        side="right"
+        width={aiPanelWidth}
+        min={320}
+        max={900}
+        onResize={(w) => {
+          document.documentElement.style.setProperty("--ai-panel-width", `${w}px`);
+          update("aiPanelWidth", w);
+        }}
+        onReset={() => update("aiPanelWidth", DEFAULT_SETTINGS.aiPanelWidth)}
+        label="调整 AI 面板宽度"
+      />
+      <aside className="ai-panel" style={{ width: aiPanelWidth }}>
       <div className="ai-panel-header">
         <Brain size={16} style={{ color: "var(--accent)" }} />
         <span style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>AI 解读</span>
+        <button
+          className="btn-icon btn-ghost"
+          onClick={() => void openAiFolder()}
+          title="打开 AI 结果文件夹"
+        >
+          <FolderOpen size={15} />
+        </button>
         <button className="btn-icon btn-ghost" onClick={onClose} title="关闭面板">
           <X size={15} />
         </button>
@@ -590,6 +736,20 @@ export default function AiPanel({ onClose, push }: Props) {
               )}
               {activeRun.status === "cancelled" && <span className="ai-chip subtle">已停止</span>}
               <span style={{ flex: 1 }} />
+              {activeRun.savedPath && (
+                <button
+                  className="btn-icon btn-ghost"
+                  onClick={() => {
+                    const error = useDoc.getState().open(activeRun.savedPath!);
+                    void error.then((message) => {
+                      if (message) push(`打开失败: ${message}`, "error");
+                    });
+                  }}
+                  title={`在标签中打开：${activeRun.savedPath}`}
+                >
+                  <FileText size={13} />
+                </button>
+              )}
               <button
                 className="btn-icon btn-ghost"
                 onClick={() => void copyOutput()}
@@ -638,7 +798,18 @@ export default function AiPanel({ onClose, push }: Props) {
         {/* Previous runs */}
         {ai.runs.length > 1 && (
           <div className="ai-history">
-            <div className="ai-history-title">本次会话的解读记录</div>
+            <div className="ai-history-title">
+              <span>本次会话的解读记录</span>
+              {ai.runs.some((r) => r.mode === "qa") && (
+                <button
+                  className="ai-history-save"
+                  onClick={() => void saveConversation()}
+                  title="把全部问答整理成一份 Markdown 保存"
+                >
+                  保存整段对话
+                </button>
+              )}
+            </div>
             {ai.runs
               .filter((r) => r.id !== activeRun?.id)
               .map((r) => (
@@ -653,6 +824,7 @@ export default function AiPanel({ onClose, push }: Props) {
                   <span className="ai-history-text">
                     {r.question ?? r.output.slice(0, 40) ?? "（空）"}
                   </span>
+                  {r.savedPath && <span className="ai-history-saved" title="已保存">✓</span>}
                 </button>
               ))}
           </div>
@@ -717,6 +889,7 @@ export default function AiPanel({ onClose, push }: Props) {
           <div className="info-banner">浏览器预览模式不支持 AI 解读，请在桌面版中使用。</div>
         )}
       </div>
-    </aside>
+      </aside>
+    </>
   );
 }

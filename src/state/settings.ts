@@ -22,6 +22,17 @@ export interface Settings {
   smoothScroll: boolean;
   /** Open the AI panel automatically when a document loads. */
   aiAutoOpen: boolean;
+  /** Left panel width in px; drag the divider to change it. */
+  sidebarWidth: number;
+  /** AI panel width in px. */
+  aiPanelWidth: number;
+  /**
+   * Where AI output is written. Empty means "Auto": a folder next to the
+   * executable, so the artefacts travel with the app and are trivial to find.
+   */
+  aiSaveDir: string;
+  /** Open each archived AI result in a tab as soon as it is written. */
+  openSavedArtifacts: boolean;
 }
 
 export const ACCENTS = [
@@ -51,6 +62,10 @@ export const DEFAULT_SETTINGS: Settings = {
   autoReload: true,
   smoothScroll: true,
   aiAutoOpen: false,
+  sidebarWidth: 272,
+  aiPanelWidth: 420,
+  aiSaveDir: "",
+  openSavedArtifacts: true,
 };
 
 interface SettingsStore extends Settings {
@@ -98,11 +113,28 @@ export const useSettings = create<SettingsStore>()(
               : '"Inter", -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif',
         );
         root.style.setProperty("scroll-behavior", s.smoothScroll ? "smooth" : "auto");
+        // Panel widths live in CSS variables so the drag can update the layout
+        // without a React re-render per pixel.
+        root.style.setProperty("--sidebar-width", `${s.sidebarWidth}px`);
+        root.style.setProperty("--ai-panel-width", `${s.aiPanelWidth}px`);
       },
     }),
     {
       name: "markthink-settings",
-      version: 2,
+      version: 3,
+      /**
+       * Fill in keys added after a user's settings were first written.
+       *
+       * Without this, someone upgrading from v2 has `sidebarWidth: undefined`
+       * and the panel collapses to 0 px — the merge is shallow, so a missing
+       * key is not replaced by the default.
+       */
+      migrate: (persisted, from) => {
+        if (from < 3) {
+          return { ...DEFAULT_SETTINGS, ...(persisted as Partial<Settings>) };
+        }
+        return persisted as Settings;
+      },
       partialize: (state) => {
         const { update: _u, reset: _r, apply: _a, ...rest } = state as SettingsStore;
         return rest;

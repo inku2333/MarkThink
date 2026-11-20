@@ -13,7 +13,8 @@ import {
   PanelLeftOpen,
 } from "lucide-react";
 import { useDoc } from "@/state/document";
-import { useSettings } from "@/state/settings";
+import { useSettings, DEFAULT_SETTINGS } from "@/state/settings";
+import { ResizeHandle } from "./ResizeHandle";
 import { bridge } from "@/lib/bridge";
 import { basename, cn, stripExt } from "@/lib/utils";
 
@@ -25,8 +26,8 @@ interface Props {
 type Tab = "outline" | "files" | "recent";
 
 export default function Sidebar({ onOpenFile, onOpenFolder }: Props) {
-  const { doc, outline, activeHeading, recent, workspace, workspaceEntries, loadWorkspace, clearRecent } = useDoc();
-  const { showSidebar, update, showOutline } = useSettings();
+  const { doc, outline, activeHeading, recent, workspace, workspaceEntries, loadWorkspace, clearRecent, tabs } = useDoc();
+  const { showSidebar, update, showOutline, sidebarWidth } = useSettings();
   const [tab, setTab] = useState<Tab>("outline");
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -58,8 +59,9 @@ export default function Sidebar({ onOpenFile, onOpenFolder }: Props) {
   }
 
   return (
-    <aside className="sidebar">
-      <div className="sidebar-header">
+    <>
+      <aside className="sidebar" style={{ width: sidebarWidth }}>
+        <div className="sidebar-header">
         <div className="segmented fill" style={{ flex: 1 }}>
           <button className={cn(tab === "outline" && "active")} onClick={() => setTab("outline")}>
             大纲
@@ -143,7 +145,7 @@ export default function Sidebar({ onOpenFile, onOpenFolder }: Props) {
                   .map((entry) => (
                     <button
                       key={entry.path}
-                      className={cn("file-item", doc?.meta.path === entry.path && "active")}
+                      className={cn("file-item", tabs.some((t) => t.path === entry.path) && "active")}
                       onClick={() => {
                         if (entry.isDir) void loadWorkspace(entry.path);
                         else void useDoc.getState().open(entry.path);
@@ -178,7 +180,7 @@ export default function Sidebar({ onOpenFile, onOpenFolder }: Props) {
                 {recent.map((path) => (
                   <button
                     key={path}
-                    className={cn("file-item", doc?.meta.path === path && "active")}
+                    className={cn("file-item", tabs.some((t) => t.path === path) && "active")}
                     onClick={() => void useDoc.getState().open(path)}
                     title={path}
                   >
@@ -197,7 +199,23 @@ export default function Sidebar({ onOpenFile, onOpenFolder }: Props) {
           {outline.length} 个标题
         </div>
       )}
-    </aside>
+      </aside>
+
+      <ResizeHandle
+        side="left"
+        width={sidebarWidth}
+        min={200}
+        max={560}
+        onResize={(w) => {
+          // Update the CSS variable directly during the drag (no re-render per
+          // pixel), then commit to the store so it survives a restart.
+          document.documentElement.style.setProperty("--sidebar-width", `${w}px`);
+          update("sidebarWidth", w);
+        }}
+        onReset={() => update("sidebarWidth", DEFAULT_SETTINGS.sidebarWidth)}
+        label="调整侧边栏宽度"
+      />
+    </>
   );
 }
 

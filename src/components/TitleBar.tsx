@@ -10,6 +10,7 @@ import {
   Search,
   MoreHorizontal,
   Github,
+  Save,
 } from "lucide-react";
 import { useDoc } from "@/state/document";
 import { useSettings, type ThemeMode } from "@/state/settings";
@@ -20,6 +21,7 @@ interface Props {
   onOpenSettings: () => void;
   onToggleAi: () => void;
   onOpenAbout: () => void;
+  onSave: () => void;
   aiOpen: boolean;
 }
 
@@ -28,9 +30,10 @@ export default function TitleBar({
   onOpenSettings,
   onToggleAi,
   onOpenAbout,
+  onSave,
   aiOpen,
 }: Props) {
-  const { doc } = useDoc();
+  const { doc, tabs } = useDoc();
   const { theme, update } = useSettings();
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -59,8 +62,16 @@ export default function TitleBar({
       <div className="titlebar-drag" data-tauri-drag-region>
         <FileText size={15} style={{ color: "var(--accent)", flexShrink: 0 }} />
         <span className="titlebar-title">
-          {doc ? basename(doc.meta.path || doc.meta.name) : "MarkThink"}
+          {doc ? `${basename(doc.meta.path || doc.meta.name)}${doc.dirty ? " •" : ""}` : "MarkThink"}
         </span>
+        {tabs.length > 1 && (
+          <>
+            <span className="titlebar-dot" />
+            <span className="titlebar-title" style={{ fontSize: 12 }}>
+              {tabs.length} 个文档
+            </span>
+          </>
+        )}
         {doc?.truncated && (
           <>
             <span className="titlebar-dot" />
@@ -74,6 +85,17 @@ export default function TitleBar({
       <button className="btn-icon" onClick={onOpenFile} title="打开文件 (Ctrl+O)">
         <FolderOpen size={16} />
       </button>
+
+      {doc && (
+        <button
+          className={cn("btn-icon", doc.dirty && "active")}
+          onClick={onSave}
+          title="保存 (Ctrl+S)"
+          disabled={!doc.dirty}
+        >
+          <Save size={16} />
+        </button>
+      )}
 
       {doc && (
         <button className="btn-icon" onClick={search} title="搜索 (Ctrl+F)">
@@ -103,6 +125,11 @@ export default function TitleBar({
         </button>
         {menuOpen && (
           <div className="popover" style={{ minWidth: 200 }}>
+            <button className="popover-row" onClick={() => { setMenuOpen(false); onSave(); }}>
+              保存
+              <span className="popover-row-note">Ctrl+S</span>
+            </button>
+            <div className="popover-divider" />
             <button className="popover-row" onClick={() => { setMenuOpen(false); window.dispatchEvent(new CustomEvent("markthink://export-html")); }}>
               导出为 HTML
             </button>
