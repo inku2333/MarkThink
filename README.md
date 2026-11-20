@@ -7,13 +7,9 @@
 [![React](https://img.shields.io/badge/React-19-61DAFB)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange)](https://www.rust-lang.org)
 
-MarkThink 是一个基于 Tauri v2 的跨平台 Markdown 阅读器。它用系统自带的 WebView 渲染，
-安装包只有 6.7 MB，内存占用约 60 MB，同时把排版、代码高亮、数学公式、图表做到位，
-并能接入十家大模型服务，支持转PDF和打印。
+MarkThink 是一个基于 Tauri v2 的跨平台 Markdown 阅读器。它用系统自带的 WebView 渲染， 安装包只有 6.7 MB，内存占用约 60 MB，同时把排版、代码高亮、数学公式、图表做到位， 并能接入十家大模型服务，为你的文档生成结构化的解读，同时支持本地Ollama模型，支持转PDF和打印。
 
 作者：[云间Yuki](https://github.com/inku2333)
-
-欢迎提出各种建议和意见^_^
 
 ---
 
@@ -29,6 +25,49 @@ MarkThink 是一个基于 Tauri v2 的跨平台 Markdown 阅读器。它用系�
 - **排版可调**：字号、行高、内容宽度、字体（衬线 / 无衬线 / 等宽）实时生效
 - **主题**：6 种强调色 × 明亮 / 暗黑 / 跟随系统
 - **其他**：拖拽打开、最近记录、外部修改自动重载、导出独立 HTML、打印 / 导出 PDF
+
+### 多标签（v2.0）
+
+像 Notepad++ 一样同时打开多个文档，每个标签互不干扰：
+
+- **标签栏**：切换、关闭（可中键关闭）、超出宽度自动滚动，活动标签始终可见
+- **各自独立**：每个文档保存自己的未保存修改、滚动位置与视图模式
+- **安全关闭**：有未保存修改的标签在关闭前会确认，`Ctrl+S` 随时保存
+- **一次多选**：`Ctrl+O` 可多选文件，逐个在独立标签中打开
+- **快捷键**：`Ctrl+W` 关闭、`Ctrl+Tab` / `Ctrl+Shift+Tab` 循环切换、`Ctrl+1…9` 直达
+
+### 可视化编辑（v2.0）
+
+直接改「最终的显示效果」，Markdown 原文由程序自动改写：
+
+- **所见即所得**：在渲染结果上直接打字、选中、拖拽，排版与阅读视图完全一致
+- **工具栏**：高频操作用常驻按钮，宽度不够时自动换行，任何窗口尺寸下都点得到
+- **「更多」面板**：按用途分组的完整格式库——
+  - **段落**：正文、标题 1–6、引用、代码块
+  - **字符格式**：加粗、斜体、下划线、删除线、高亮、行内代码、上标、下标、清除格式
+  - **列表与对齐**：无序 / 有序 / 任务列表、增减缩进、左 / 中 / 右 / 两端对齐
+  - **插入**：链接、表格、图片、分隔线、数学公式、Mermaid 图表、代码片段
+  - **颜色与字号**：24 色调色盘 + 原生取色器 + 十六进制输入、8 档字号预设、
+    **可自由输入 1–50 的字号**、6 档行高
+  - **编辑**：撤销、重做、复制、剪切、删除选中、全选
+  - **表格**（光标在表格内时出现）：增删行列、合并 / 拆分单元格、删除表格
+- **字体选择**：衬线 / 无衬线 / 等宽 / 楷体 / 宋体 / 黑体
+- **源码视图**：需要精确控制时切到源码，选中段落后仍可用样式菜单一键套用
+- **公式与图表可编辑**：公式、Mermaid 图表在手边就是「左侧改源码 + 右侧实时预览」，
+  改一个字符就能立刻看到渲染结果，语法写错会给出定位提示
+- **原样保留**：编辑器无法表达的区块以只读卡片保留，保存时一字不改；
+  **没有改动过的区块整段原样写回**，不会重排你的文件
+- **位置不丢**：阅读 / 编辑 / 源码之间来回切换，停在哪一页就还在哪一页
+- **关前提醒**：有未保存修改时，`Ctrl+W`、关闭标签、关闭全部、甚至点窗口的 ✕
+  都会先问一句「保存 / 不保存 / 取消」，保存失败不会把文档关掉
+- **面板可拖拽**：左右侧边栏都能拖动调整宽度（双击恢复默认），AI 面板可以拉宽到
+  舒服阅读，宽度会被记住
+- **AI 产出自动归档**：每次解读完成都会写一份 Markdown 到程序同级的 `MarkThink-AI/`
+  文件夹（位置可在设置里改），并默认直接在标签中打开；多轮问答可一键保存成一份
+  完整对话记录。同名不同内容自动编号，绝不覆盖
+
+> 保存是原子的：先写临时文件再替换，避免中途失败损坏原文档。
+> 原本带 BOM 的文件会原样写回 BOM。
 
 ### AI 解读
 
@@ -97,7 +136,7 @@ MarkThink 是一个基于 Tauri v2 的跨平台 Markdown 阅读器。它用系�
 
 | 组件 | 版本 |
 | --- | --- |
-| Node.js | 18+ |
+| Node.js | 20.19+ 或 22.12+（Vite 7 的要求） |
 | Rust | stable（MSVC 工具链） |
 | WebView2 Runtime | Windows 10/11 通常已预装 |
 
@@ -116,16 +155,22 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
-构建产物位于 `src-tauri/target/release/bundle/`。
+构建产物位于仓库根目录的 `target/release/`：`markthink.exe` 是主程序，
+安装包在 `target/release/bundle/nsis/`（由 `.cargo/config.toml` 的
+`target-dir` 指定，不是 `src-tauri/target`）。
+
+> 本机没有系统级 Rust，工具链随仓库放在 `.toolchain/`，由 `npm run tauri:*`
+> 自动注入 `CARGO_HOME` / `RUSTUP_HOME` / `PATH`（见 [BUILD.md](BUILD.md) 2.1.1）。
+> 想手敲 `cargo` 先执行 `call rust-env.cmd`。
 
 ### 测试
 
 ```bash
-npm test                       # 前端单元测试（大纲锚点、标题计数）
-cd src-tauri && cargo test     # 后端单元测试（流解析、提示词、模型目录）
+npm test                       # 前端单元测试（大纲锚点、搜索索引与分块导航）
+npm run rust:test              # 后端单元测试（流解析、提示词、模型目录）
 
 # 需要本机运行 Ollama 的集成测试
-OLLAMA_TEST_MODEL=qwen3.5:4b cargo test -- --ignored --nocapture
+OLLAMA_TEST_MODEL=qwen3.5:4b npm run rust:test -- -- --ignored --nocapture
 ```
 
 ### 代码签名（可选）
@@ -146,7 +191,7 @@ OLLAMA_TEST_MODEL=qwen3.5:4b cargo test -- --ignored --nocapture
 然后构建时合并该配置：
 
 ```bash
-npx tauri build --config src-tauri/tauri.local.conf.json
+npm run tauri -- build --config src-tauri/tauri.local.conf.json
 ```
 
 ## 项目结构
@@ -154,7 +199,7 @@ npx tauri build --config src-tauri/tauri.local.conf.json
 ```
 src/
   components/      界面组件（Reader / Sidebar / AiPanel / AboutDialog / Settings…）
-  lib/             渲染管线（markdown / blocks / highlight / math / mermaid）
+  lib/             渲染管线（markdown / blocks / chunks / search / highlight / math / mermaid）
   state/           Zustand 状态（settings / document / ai）
   styles/          主题变量、全局样式、打印样式
 src-tauri/
@@ -170,11 +215,15 @@ samples/           测试文档
 
 | 组合 | 功能 |
 | --- | --- |
-| `Ctrl+O` | 打开文件 |
+| `Ctrl+O` | 打开文件（可多选，各自开一个标签） |
+| `Ctrl+S` | 保存当前文档 |
+| `Ctrl+W` | 关闭当前文档 |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | 下一个 / 上一个标签 |
+| `Ctrl+1` … `Ctrl+9` | 跳到第 N 个标签 |
+| `Ctrl+E` | 循环切换 阅读 / 编辑 / 源码（`Ctrl+Shift+E` 反向） |
 | `Ctrl+F` | 文档内搜索 |
 | `Ctrl+,` | 设置 |
 | `Ctrl+Shift+T` | AI 解读面板 |
-| `Ctrl+W` | 关闭文档 |
 | `Esc` | 关闭搜索 / 弹窗 |
 
 ## 技术栈
@@ -183,6 +232,7 @@ samples/           测试文档
 - **前端**：React 19 + TypeScript + Vite
 - **渲染**：[markdown-it](https://github.com/markdown-it/markdown-it)、
   [Shiki](https://shiki.style)、[KaTeX](https://katex.org)、[Mermaid](https://mermaid.js.org)
+- **可视化编辑**：[Tiptap](https://tiptap.dev)（ProseMirror）+ 自研 Markdown 序列化器
 - **后端**：Rust + tokio + reqwest
 
 ## 贡献
@@ -191,7 +241,7 @@ samples/           测试文档
 
 - 发现 Bug：请说明复现步骤、系统版本与截图
 - 新增模型提供方：参考 [DEVELOPMENT.md](DEVELOPMENT.md) 中的接入说明
-- 提交代码前请确保 `npm test` 与 `cargo test` 通过
+- 提交代码前请确保 `npm test` 与 `npm run rust:test` 通过
 
 ## 许可证
 

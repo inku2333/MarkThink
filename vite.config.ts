@@ -30,7 +30,18 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      ignored: [
+        "**/src-tauri/**",
+        // `.tmp/` is the repo-local scratch directory (see BUILD.md). It also
+        // holds WebView2's profile while the app runs, and that tree is written
+        // to constantly — watching it makes Vite exit with EBUSY on a locked
+        // cache file, which takes the dev server (and `tauri:dev`) down.
+        "**/.tmp/**",
+        // Build output and dependencies never need watching.
+        "**/dist/**",
+        "**/target/**",
+        "**/node_modules/**",
+      ],
     },
   },
   envPrefix: ["VITE_", "TAURI_ENV_*"],
